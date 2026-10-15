@@ -1,0 +1,6 @@
+dist/
+coverage/
+node_modules/
+src/assets/maps/
+playwright-report/
+test-results/

@@ -1,25 +1,29 @@
 package do
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
 )
 
 type AlumniListQuery struct {
-	Page         common.PageQuery
-	Keyword      string
-	Grade        string
-	ClassName    string
-	Cohort       string
-	Counselor    string
-	Mentor       string
-	Major        string
-	TrainingMode string
-	Industry     string
-	WorkUnit     string
-	Position     string
-	Mobile       string
+	Page             common.PageQuery
+	Keyword          string
+	Grade            string
+	ClassName        string
+	Cohort           string
+	Counselor        string
+	Mentor           string
+	Major            string
+	TrainingMode     string
+	Industry         string
+	WorkUnit         string
+	Position         string
+	Mobile           string
+	DataDomainID     *uint64
+	DataDomainIDs    []uint64
+	CanReadSensitive bool
 }
 
 type AlumniEditableProfile struct {
@@ -49,6 +53,7 @@ type AlumniUpdateProfile struct {
 }
 
 type AlumniCreateProfile struct {
+	DataDomainID   *uint64
 	Name           string
 	Grade          string
 	ClassName      *string
@@ -142,6 +147,18 @@ func (q AlumniListQuery) Normalize() AlumniListQuery {
 	q.WorkUnit = strings.TrimSpace(q.WorkUnit)
 	q.Position = strings.TrimSpace(q.Position)
 	q.Mobile = strings.TrimSpace(q.Mobile)
+	q.DataDomainIDs = append([]uint64(nil), q.DataDomainIDs...)
+	sort.Slice(q.DataDomainIDs, func(i, j int) bool { return q.DataDomainIDs[i] < q.DataDomainIDs[j] })
+	if len(q.DataDomainIDs) > 1 {
+		writeIndex := 1
+		for _, id := range q.DataDomainIDs[1:] {
+			if id != q.DataDomainIDs[writeIndex-1] {
+				q.DataDomainIDs[writeIndex] = id
+				writeIndex++
+			}
+		}
+		q.DataDomainIDs = q.DataDomainIDs[:writeIndex]
+	}
 	return q
 }
 

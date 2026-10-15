@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
+  EyeOutlined,
   FileTextOutlined,
   PlusOutlined,
   SearchOutlined,
@@ -20,22 +21,36 @@ import {
   Select,
   Space,
   Table,
+  Tag,
   message,
 } from 'antd';
 import type { MenuProps } from 'antd';
 import type { ColumnsType, TablePaginationConfig } from 'antd/es/table';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { alumniApi } from '../../api/alumni';
 import { PageHeader } from '../../components/PageHeader';
 import { StatusText } from '../../components/StatusText';
-import type { AlumniImportResult, AlumniProfile, AlumniProfilePayload, AlumniQuery } from '../../types/alumni';
+import { useAuthStore } from '../../store/authStore';
+import type { DataDomain } from '../../types/auth';
+import type {
+  AlumniImportResult,
+  AlumniProfile,
+  AlumniProfilePayload,
+  AlumniQuery,
+} from '../../types/alumni';
+import { canReadSensitive } from '../../utils/access';
 import { genderOptions, industryOptions, trainingModeOptions } from '../../utils/dictionaries';
 
 const defaultPageSize = 20;
+const emptyDomains: DataDomain[] = [];
 
 export function AlumniManagementPage() {
+  const user = useAuthStore((state) => state.user);
+  const domains = user?.domains ?? emptyDomains;
+  const sensitiveReadable = canReadSensitive(user);
   const [searchForm] = Form.useForm<AlumniQuery>();
   const [modalForm] = Form.useForm<AlumniProfilePayload>();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const urlKeyword = searchParams.get('keyword') || undefined;
   const [items, setItems] = useState<AlumniProfile[]>([]);
@@ -52,10 +67,11 @@ export function AlumniManagementPage() {
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<AlumniImportResult | null>(null);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [importDomainID, setImportDomainID] = useState<number>();
   const dataRequestIdRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const loadData = async (nextQuery: AlumniQuery) => {
+  const loadData = useCallback(async (nextQuery: AlumniQuery) => {
     const requestId = dataRequestIdRef.current + 1;
     dataRequestIdRef.current = requestId;
     setLoading(true);
@@ -77,11 +93,11 @@ export function AlumniManagementPage() {
         setLoading(false);
       }
     }
-  };
+  }, []);
 
   useEffect(() => {
     void loadData(query);
-  }, [query]);
+  }, [loadData, query]);
 
   useEffect(() => {
     searchForm.setFieldsValue({ keyword: urlKeyword });
@@ -97,14 +113,18 @@ export function AlumniManagementPage() {
   const openCreateModal = () => {
     setEditing(null);
     modalForm.resetFields();
+    if (domains.length === 1) modalForm.setFieldValue('data_domain_id', domains[0].id);
     setModalOpen(true);
   };
 
-  const openEditModal = (record: AlumniProfile) => {
-    setEditing(record);
-    modalForm.setFieldsValue(record);
-    setModalOpen(true);
-  };
+  const openEditModal = useCallback(
+    (record: AlumniProfile) => {
+      setEditing(record);
+      modalForm.setFieldsValue(record);
+      setModalOpen(true);
+    },
+    [modalForm],
+  );
 
   const closeModal = () => {
     setModalOpen(false);
@@ -133,16 +153,19 @@ export function AlumniManagementPage() {
     }
   };
 
-  const handleRemove = async (record: AlumniProfile) => {
-    try {
-      await alumniApi.remove(record.id);
-      message.success('校友档案已删除');
-      await loadData(query);
-    } catch (error) {
-      const err = error as Error;
-      message.error(err.message || '删除失败');
-    }
-  };
+  const handleRemove = useCallback(
+    async (record: AlumniProfile) => {
+      try {
+        await alumniApi.remove(record.id);
+        message.success('校友档案已删除');
+        await loadData(query);
+      } catch (error) {
+        const err = error as Error;
+        message.error(err.message || '删除失败');
+      }
+    },
+    [loadData, query],
+  );
 
   const columns = useMemo<ColumnsType<AlumniProfile>>(
     () => [
@@ -156,6 +179,14 @@ export function AlumniManagementPage() {
         title: '年级',
         dataIndex: 'grade',
         width: 110,
+      },
+      {
+        title: '培养类别',
+        dataIndex: 'data_domain_id',
+        width: 170,
+        render: (value: number) => (
+          <Tag>{domains.find((domain) => domain.id === value)?.name || '-'}</Tag>
+        ),
       },
       {
         title: '班级',
@@ -177,12 +208,16 @@ export function AlumniManagementPage() {
         dataIndex: 'industry',
         width: 140,
       },
-      {
-        title: '工作单位',
-        dataIndex: 'work_unit',
-        width: 220,
-        ellipsis: true,
-      },
+      ...(sensitiveReadable
+        ? [
+            {
+              title: '工作单位',
+              dataIndex: 'work_unit',
+              width: 220,
+              ellipsis: true,
+            },
+          ]
+        : []),
       {
         title: '状态',
         dataIndex: 'status',
@@ -196,6 +231,13 @@ export function AlumniManagementPage() {
         width: 160,
         render: (_, record) => (
           <Space size={4}>
+            <Button
+              type="link"
+              icon={<EyeOutlined />}
+              onClick={() => navigate(`/alumni/${record.id}`)}
+            >
+              查看
+            </Button>
             <Button type="link" icon={<EditOutlined />} onClick={() => openEditModal(record)}>
               编辑
             </Button>
@@ -212,7 +254,7 @@ export function AlumniManagementPage() {
         ),
       },
     ],
-    [handleRemove, openEditModal],
+    [domains, handleRemove, navigate, openEditModal, sensitiveReadable],
   );
 
   const handleSearch = (values: AlumniQuery) => {
@@ -296,7 +338,7 @@ export function AlumniManagementPage() {
 
     setImporting(true);
     try {
-      const result = await alumniApi.importData(file);
+      const result = await alumniApi.importData(file, importDomainID);
       setImportResult(result);
       setImportModalOpen(true);
       await loadData(query);
@@ -320,7 +362,7 @@ export function AlumniManagementPage() {
     <>
       <PageHeader
         title="校友管理"
-        description="管理员维护 MPA 校友基础档案"
+        description="管理员维护可管理范围内的校友基础档案"
         extra={
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreateModal}>
             新增校友
@@ -348,6 +390,13 @@ export function AlumniManagementPage() {
               options={industryOptions.map((value) => ({ label: value, value }))}
             />
           </Form.Item>
+          <Form.Item name="data_domain_id">
+            <Select
+              allowClear
+              placeholder="培养类别"
+              options={domains.map((domain) => ({ label: domain.name, value: domain.id }))}
+            />
+          </Form.Item>
           <Space>
             <Button type="primary" htmlType="submit" icon={<SearchOutlined />}>
               查询
@@ -355,6 +404,14 @@ export function AlumniManagementPage() {
             <Button icon={<UndoOutlined />} onClick={handleReset}>
               重置
             </Button>
+            <Select
+              value={importDomainID}
+              onChange={setImportDomainID}
+              allowClear
+              placeholder="导入目标培养类别"
+              style={{ width: 170 }}
+              options={domains.map((domain) => ({ label: domain.name, value: domain.id }))}
+            />
             <Button icon={<UploadOutlined />} loading={importing} onClick={handleImportClick}>
               导入 Excel
             </Button>
@@ -374,9 +431,7 @@ export function AlumniManagementPage() {
                 onClick: ({ key }) => handleExport(key),
               }}
             >
-              <Button icon={<DownloadOutlined />}>
-                导出
-              </Button>
+              <Button icon={<DownloadOutlined />}>导出</Button>
             </Dropdown>
           </Space>
         </Form>
@@ -408,19 +463,21 @@ export function AlumniManagementPage() {
         destroyOnClose
       >
         <Form form={modalForm} layout="vertical" className="modal-grid">
-          <Form.Item
-            label="姓名"
-            name="name"
-            rules={[{ required: true, message: '请输入姓名' }]}
-          >
-            <Input maxLength={100} />
+          <Form.Item label="姓名" name="name" rules={[{ required: true, message: '请输入姓名' }]}>
+            <Input data-testid="alumni-name-input" maxLength={100} />
+          </Form.Item>
+          <Form.Item label="年级" name="grade" rules={[{ required: true, message: '请输入年级' }]}>
+            <Input data-testid="alumni-grade-input" maxLength={50} />
           </Form.Item>
           <Form.Item
-            label="年级"
-            name="grade"
-            rules={[{ required: true, message: '请输入年级' }]}
+            label="培养类别"
+            name="data_domain_id"
+            rules={[{ required: true, message: '请选择培养类别' }]}
           >
-            <Input maxLength={50} />
+            <Select
+              disabled={Boolean(editing) || domains.length === 1}
+              options={domains.map((domain) => ({ label: domain.name, value: domain.id }))}
+            />
           </Form.Item>
           <Form.Item label="班级" name="class_name">
             <Input maxLength={100} />
@@ -429,17 +486,18 @@ export function AlumniManagementPage() {
             <Input maxLength={50} />
           </Form.Item>
           <Form.Item label="性别" name="gender">
-            <Select
-              allowClear
-              options={genderOptions.map((value) => ({ label: value, value }))}
-            />
+            <Select allowClear options={genderOptions.map((value) => ({ label: value, value }))} />
           </Form.Item>
-          <Form.Item label="手机号" name="mobile">
-            <Input maxLength={30} />
-          </Form.Item>
-          <Form.Item label="邮箱" name="email">
-            <Input maxLength={255} />
-          </Form.Item>
+          {sensitiveReadable ? (
+            <Form.Item label="手机号" name="mobile">
+              <Input maxLength={30} />
+            </Form.Item>
+          ) : null}
+          {sensitiveReadable ? (
+            <Form.Item label="邮箱" name="email">
+              <Input maxLength={255} />
+            </Form.Item>
+          ) : null}
           <Form.Item label="专业" name="major">
             <Input maxLength={100} />
           </Form.Item>
@@ -461,15 +519,21 @@ export function AlumniManagementPage() {
               options={industryOptions.map((value) => ({ label: value, value }))}
             />
           </Form.Item>
-          <Form.Item label="工作单位" name="work_unit">
-            <Input maxLength={255} />
-          </Form.Item>
-          <Form.Item label="职务" name="position">
-            <Input maxLength={100} />
-          </Form.Item>
-          <Form.Item label="通讯地址" name="mailing_address" className="modal-grid-wide">
-            <Input.TextArea rows={3} maxLength={255} showCount />
-          </Form.Item>
+          {sensitiveReadable ? (
+            <Form.Item label="工作单位" name="work_unit">
+              <Input maxLength={255} />
+            </Form.Item>
+          ) : null}
+          {sensitiveReadable ? (
+            <Form.Item label="职务" name="position">
+              <Input maxLength={100} />
+            </Form.Item>
+          ) : null}
+          {sensitiveReadable ? (
+            <Form.Item label="通讯地址" name="mailing_address" className="modal-grid-wide">
+              <Input.TextArea rows={3} maxLength={255} showCount />
+            </Form.Item>
+          ) : null}
           <Form.Item label="管理员备注" name="remark" className="modal-grid-wide">
             <Input.TextArea rows={3} />
           </Form.Item>

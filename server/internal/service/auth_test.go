@@ -12,26 +12,65 @@ import (
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/do"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/dto"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
+	"github.com/golang-jwt/jwt/v5"
 	sms "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/sms/v20210111"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type fakeUserStore struct {
-	user          *model.User
-	usersByID     map[uint64]*model.User
-	users         []*model.User
-	total         int64
-	created       *model.User
-	createProfile do.AdminCreateProfile
-	createHash    string
-	deleteID      uint64
-	findErr       error
-	listErr       error
-	createErr     error
-	deleteErr     error
-	updateErr     error
-	lastLoginAt   time.Time
-	updatedUserID uint64
+	user               *model.User
+	usersByID          map[uint64]*model.User
+	users              []*model.User
+	total              int64
+	created            *model.User
+	createProfile      do.AdminCreateProfile
+	createHash         string
+	createDomainIDs    []uint64
+	createPermissions  []string
+	replaceID          uint64
+	replaceDomainIDs   []uint64
+	replacePermissions []string
+	replaceErr         error
+	deleteID           uint64
+	findErr            error
+	listErr            error
+	createErr          error
+	deleteErr          error
+	updateErr          error
+	lastLoginAt        time.Time
+	updatedUserID      uint64
+}
+
+func TestAuthServiceCurrentUserReturnsActiveAccess(t *testing.T) {
+	name := "管理员"
+	users := &fakeUserStore{user: &model.User{
+		ID:       2,
+		Account:  "manager01",
+		Role:     common.RoleAdmin,
+		RealName: &name,
+		Status:   common.UserStatusActive,
+	}}
+	accessStore := &fakeAdminAccessStore{domains: activeAdminDomains()}
+	service := NewAuthService(users, nil, nil, nil, config.Config{}, accessStore)
+
+	result, err := service.CurrentUser(context.Background(), common.AccessContext{
+		UserID:    2,
+		Role:      common.RoleAdmin,
+		DomainIDs: []uint64{2},
+		Permissions: map[string]bool{
+			common.PermissionAlumniSensitiveRead: true,
+			"unknown.permission":                 true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CurrentUser() error = %v", err)
+	}
+	if result.Account != "manager01" || len(result.Domains) != 1 || result.Domains[0].ID != 2 {
+		t.Fatalf("unexpected current user domains: %+v", result)
+	}
+	if len(result.Permissions) != 1 || result.Permissions[0] != common.PermissionAlumniSensitiveRead {
+		t.Fatalf("unexpected current user permissions: %v", result.Permissions)
+	}
 }
 
 func (s *fakeUserStore) FindByAccount(context.Context, string) (*model.User, error) {
@@ -53,9 +92,11 @@ func (s *fakeUserStore) ListAdmins(_ context.Context, _ do.AdminListQuery) ([]*m
 	return s.users, s.total, s.listErr
 }
 
-func (s *fakeUserStore) CreateAdmin(_ context.Context, profile do.AdminCreateProfile, passwordHash string) (*model.User, error) {
+func (s *fakeUserStore) CreateAdminWithAccess(_ context.Context, profile do.AdminCreateProfile, passwordHash string, domainIDs []uint64, permissions []string, _ common.AccessContext) (*model.User, error) {
 	s.createProfile = profile
 	s.createHash = passwordHash
+	s.createDomainIDs = append([]uint64(nil), domainIDs...)
+	s.createPermissions = append([]string(nil), permissions...)
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
@@ -71,6 +112,26 @@ func (s *fakeUserStore) CreateAdmin(_ context.Context, profile do.AdminCreatePro
 		Mobile:       profile.Mobile,
 		Status:       common.UserStatusActive,
 	}, nil
+}
+
+func (s *fakeUserStore) ReplaceAdminAccess(_ context.Context, id uint64, domainIDs []uint64, permissions []string, _ common.AccessContext) (*model.User, error) {
+	s.replaceID = id
+	s.replaceDomainIDs = append([]uint64(nil), domainIDs...)
+	s.replacePermissions = append([]string(nil), permissions...)
+	if s.replaceErr != nil {
+		return nil, s.replaceErr
+	}
+	if s.usersByID != nil {
+		user, ok := s.usersByID[id]
+		if !ok {
+			return nil, common.ErrUserNotFound
+		}
+		if user.Role == common.RoleSuperAdmin {
+			return nil, common.ErrCannotModifySuper
+		}
+		return user, nil
+	}
+	return s.user, nil
 }
 
 func (s *fakeUserStore) DeleteAdmin(_ context.Context, id uint64) error {
@@ -156,7 +217,7 @@ func (s *fakeAlumniStoreForAuth) ListAll(_ context.Context, _ do.AlumniListQuery
 	return nil, nil
 }
 
-func (s *fakeAlumniStoreForAuth) GetByID(_ context.Context, _ uint64) (*model.AlumniProfile, error) {
+func (s *fakeAlumniStoreForAuth) GetByID(_ context.Context, _ uint64, _ []uint64) (*model.AlumniProfile, error) {
 	return nil, common.ErrAlumniNotFound
 }
 
@@ -172,11 +233,11 @@ func (s *fakeAlumniStoreForAuth) FindExistingByDedupKey(_ context.Context, _ []d
 	return nil, nil
 }
 
-func (s *fakeAlumniStoreForAuth) Update(_ context.Context, _ uint64, _ uint64, _ do.AlumniUpdateProfile) error {
+func (s *fakeAlumniStoreForAuth) Update(_ context.Context, _ uint64, _ uint64, _ do.AlumniUpdateProfile, _ []uint64) error {
 	return nil
 }
 
-func (s *fakeAlumniStoreForAuth) Delete(_ context.Context, _ uint64, _ uint64) error {
+func (s *fakeAlumniStoreForAuth) Delete(_ context.Context, _ uint64, _ uint64, _ []uint64) error {
 	return nil
 }
 
@@ -451,6 +512,17 @@ func TestAuthServiceParseAccessToken(t *testing.T) {
 	}
 	if uid != 1 {
 		t.Fatalf("expected uid 1, got %d", uid)
+	}
+
+	claims := jwt.MapClaims{}
+	if _, _, err := new(jwt.Parser).ParseUnverified(token, claims); err != nil {
+		t.Fatalf("failed to inspect token claims: %v", err)
+	}
+	if _, ok := claims["role"]; ok {
+		t.Fatalf("access token must not contain role: %+v", claims)
+	}
+	if _, ok := claims["account"]; ok {
+		t.Fatalf("access token must not contain account: %+v", claims)
 	}
 }
 

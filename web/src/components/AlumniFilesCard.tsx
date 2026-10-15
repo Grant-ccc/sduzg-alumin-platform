@@ -6,19 +6,10 @@ import {
   FileOutlined,
   LoadingOutlined,
 } from '@ant-design/icons';
-import {
-  Button,
-  Card,
-  List,
-  Popconfirm,
-  Space,
-  Spin,
-  Tag,
-  Upload,
-  message,
-} from 'antd';
+import { Button, Card, List, Popconfirm, Space, Spin, Tag, Upload, message } from 'antd';
 import { alumniApi } from '../api/alumni';
 import { useAuthStore } from '../store/authStore';
+import { canManageFiles } from '../utils/access';
 import type { AlumniFileItem, AlumniFileListResponse } from '../types/alumni';
 
 const FILE_TYPE_LABELS: Record<string, string> = {
@@ -43,14 +34,16 @@ interface Props {
 
 export function AlumniFilesCard({ alumniId }: Props) {
   const user = useAuthStore((s) => s.user);
-  const isAdmin =
-    user?.role === 'admin' || user?.role === 'super_admin';
+  const isAdmin = canManageFiles(user);
 
   const [loading, setLoading] = useState(false);
   const [files, setFiles] = useState<AlumniFileListResponse | null>(null);
   const [uploading, setUploading] = useState<string | null>(null);
 
   const loadFiles = useCallback(async () => {
+    if (!isAdmin) {
+      return;
+    }
     setLoading(true);
     try {
       const data = await alumniApi.listFiles(alumniId);
@@ -60,16 +53,17 @@ export function AlumniFilesCard({ alumniId }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [alumniId]);
+  }, [alumniId, isAdmin]);
 
   useEffect(() => {
     void loadFiles();
   }, [loadFiles]);
 
-  const handleUpload = async (
-    fileType: 'degree_archive' | 'academic_record',
-    file: File,
-  ) => {
+  if (!isAdmin) {
+    return null;
+  }
+
+  const handleUpload = async (fileType: 'degree_archive' | 'academic_record', file: File) => {
     setUploading(fileType);
     try {
       await alumniApi.uploadFile(alumniId, fileType, file);
@@ -103,50 +97,42 @@ export function AlumniFilesCard({ alumniId }: Props) {
     }
   };
 
-  const renderFileSection = (
-    fileType: 'degree_archive' | 'academic_record',
-  ) => {
+  const renderFileSection = (fileType: 'degree_archive' | 'academic_record') => {
     const items: AlumniFileItem[] =
       fileType === 'degree_archive'
-        ? files?.degree_archive ?? []
-        : files?.academic_record ?? [];
+        ? (files?.degree_archive ?? [])
+        : (files?.academic_record ?? []);
 
     return (
       <Card
         size="small"
         title={
           <Space>
-            <Tag color={FILE_TYPE_COLORS[fileType]}>
-              {FILE_TYPE_LABELS[fileType]}
-            </Tag>
+            <Tag color={FILE_TYPE_COLORS[fileType]}>{FILE_TYPE_LABELS[fileType]}</Tag>
             <span className="text-secondary">{items.length} 个文件</span>
           </Space>
         }
         extra={
           isAdmin ? (
-            <Upload
-              accept=".pdf,.doc,.docx,.jpg,.jpeg,.png"
-              showUploadList={false}
-              beforeUpload={(file) => {
-                void handleUpload(fileType, file as File);
-                return false;
-              }}
-              disabled={uploading === fileType}
-            >
-              <Button
-                type="link"
-                icon={
-                  uploading === fileType ? (
-                    <LoadingOutlined />
-                  ) : (
-                    <FileAddOutlined />
-                  )
-                }
+            <span data-testid={`alumni-file-upload-${fileType}`}>
+              <Upload
+                accept=".pdf,.doc,.docx,.jpg,.jpeg,.png"
+                showUploadList={false}
+                beforeUpload={(file) => {
+                  void handleUpload(fileType, file as File);
+                  return false;
+                }}
                 disabled={uploading === fileType}
               >
-                {uploading === fileType ? '上传中...' : '上传文件'}
-              </Button>
-            </Upload>
+                <Button
+                  type="link"
+                  icon={uploading === fileType ? <LoadingOutlined /> : <FileAddOutlined />}
+                  disabled={uploading === fileType}
+                >
+                  {uploading === fileType ? '上传中...' : '上传文件'}
+                </Button>
+              </Upload>
+            </span>
           ) : null
         }
       >
@@ -175,11 +161,7 @@ export function AlumniFilesCard({ alumniId }: Props) {
                           description={`确定删除文件「${item.original_name}」？`}
                           onConfirm={() => handleDelete(item.id)}
                         >
-                          <Button
-                            type="link"
-                            danger
-                            icon={<DeleteOutlined />}
-                          >
+                          <Button type="link" danger icon={<DeleteOutlined />}>
                             删除
                           </Button>
                         </Popconfirm>,

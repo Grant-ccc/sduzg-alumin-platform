@@ -20,6 +20,10 @@ web/node_modules/
 web/dist/
 web/.env.local
 web/.vite/
+web/.vitest/
+web/coverage/
+web/test-results/
+web/playwright-report/
 
 # Docker / local data
 .docker/

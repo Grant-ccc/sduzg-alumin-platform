@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/do"
@@ -81,7 +80,7 @@ func (s *fakeImportStore) ListAll(_ context.Context, _ do.AlumniListQuery) ([]*m
 	return nil, nil
 }
 
-func (s *fakeImportStore) GetByID(_ context.Context, _ uint64) (*model.AlumniProfile, error) {
+func (s *fakeImportStore) GetByID(_ context.Context, _ uint64, _ []uint64) (*model.AlumniProfile, error) {
 	return nil, common.ErrAlumniNotFound
 }
 
@@ -97,11 +96,11 @@ func (s *fakeImportStore) FindExistingByDedupKey(_ context.Context, _ []do.Alumn
 	return make(map[string]bool), nil
 }
 
-func (s *fakeImportStore) Update(_ context.Context, _ uint64, _ uint64, _ do.AlumniUpdateProfile) error {
+func (s *fakeImportStore) Update(_ context.Context, _ uint64, _ uint64, _ do.AlumniUpdateProfile, _ []uint64) error {
 	return nil
 }
 
-func (s *fakeImportStore) Delete(_ context.Context, _ uint64, _ uint64) error { return nil }
+func (s *fakeImportStore) Delete(_ context.Context, _ uint64, _ uint64, _ []uint64) error { return nil }
 
 func (s *fakeImportStore) UpdateEditableFields(_ context.Context, _ uint64, _ uint64, _ do.AlumniEditableProfile) error {
 	return nil
@@ -113,64 +112,25 @@ func (s *fakeImportStore) FindOnly(_ context.Context, query do.AlumniListQuery) 
 	return nil, nil
 }
 
-func (s *fakeImportUserStore) FindByMobile(_ context.Context, _ string) (*model.User, error) {
-	return nil, common.ErrUserNotFound
-}
-func (s *fakeImportUserStore) FindByEmail(_ context.Context, _ string) (*model.User, error) {
-	return nil, common.ErrUserNotFound
-}
-func (s *fakeImportUserStore) FindByAlumniID(_ context.Context, _ uint64) (*model.User, error) {
-	return nil, common.ErrUserNotFound
-}
-func (s *fakeImportUserStore) CreateUser(_ context.Context, _ *model.User) error        { return nil }
-func (s *fakeImportUserStore) UpdateMobile(_ context.Context, _ uint64, _ string) error { return nil }
-func (s *fakeImportUserStore) UpdateEmail(_ context.Context, _ uint64, _ string) error  { return nil }
-
-type fakeImportUserStore struct{}
-
-func (s *fakeImportUserStore) FindByAccount(_ context.Context, _ string) (*model.User, error) {
-	return nil, common.ErrUserNotFound
-}
-
-func (s *fakeImportUserStore) FindByID(_ context.Context, _ uint64) (*model.User, error) {
-	return &model.User{ID: 1, Role: common.RoleAdmin, Status: common.UserStatusActive}, nil
-}
-
-func (s *fakeImportUserStore) ListAdmins(_ context.Context, _ do.AdminListQuery) ([]*model.User, int64, error) {
-	return nil, 0, nil
-}
-
-func (s *fakeImportUserStore) CreateAdmin(_ context.Context, _ do.AdminCreateProfile, _ string) (*model.User, error) {
-	return nil, nil
-}
-
-func (s *fakeImportUserStore) DeleteAdmin(_ context.Context, _ uint64) error { return nil }
-
-func (s *fakeImportUserStore) UpdateLastLoginAt(_ context.Context, _ uint64, _ time.Time) error {
-	return nil
-}
-
-func (s *fakeImportUserStore) UpdatePasswordHash(_ context.Context, _ uint64, _ string) error {
-	return nil
-}
-
 func TestImportHandlerSuccess(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	store := &fakeImportStore{}
-	users := &fakeImportUserStore{}
-	svc := service.NewAlumniService(store, users, nil)
+	svc := service.NewAlumniService(store, nil)
 	h := NewAlumniHandler(svc)
 
 	engine := gin.New()
 	engine.POST("/admin/alumni/import", func(c *gin.Context) {
-		c.Set(middleware.CurrentUserIDKey, uint64(1))
+		c.Set(middleware.AccessContextKey, &common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin})
 		h.Import(c)
 	})
 
 	buf, filename := buildMultipartXLSX(t, [][]string{{"张三", "2020级"}})
 
 	body := &bytes.Buffer{}
+	body.WriteString("--boundary\r\n")
+	body.WriteString("Content-Disposition: form-data; name=\"data_domain_id\"\r\n\r\n")
+	body.WriteString("1\r\n")
 	body.WriteString("--boundary\r\n")
 	body.WriteString("Content-Disposition: form-data; name=\"file\"; filename=\"")
 	body.WriteString(filename)
@@ -194,7 +154,7 @@ func TestImportHandlerUnauthorized(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	store := &fakeImportStore{}
-	svc := service.NewAlumniService(store, nil, nil)
+	svc := service.NewAlumniService(store, nil)
 	h := NewAlumniHandler(svc)
 
 	engine := gin.New()
@@ -226,12 +186,12 @@ func TestImportHandlerBadFile(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	store := &fakeImportStore{}
-	svc := service.NewAlumniService(store, nil, nil)
+	svc := service.NewAlumniService(store, nil)
 	h := NewAlumniHandler(svc)
 
 	engine := gin.New()
 	engine.POST("/admin/alumni/import", func(c *gin.Context) {
-		c.Set(middleware.CurrentUserIDKey, uint64(1))
+		c.Set(middleware.AccessContextKey, &common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin})
 		h.Import(c)
 	})
 

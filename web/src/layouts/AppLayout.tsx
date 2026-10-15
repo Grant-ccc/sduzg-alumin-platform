@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   BarChartOutlined,
+  BookOutlined,
+  AuditOutlined,
   IdcardOutlined,
   LogoutOutlined,
   SearchOutlined,
@@ -44,6 +46,16 @@ export function AppLayout() {
           icon: <TeamOutlined />,
           label: '校友管理',
         },
+        {
+          key: '/admin/audit/changes',
+          icon: <AuditOutlined />,
+          label: '操作历史',
+        },
+        {
+          key: '/admin/history/reviews',
+          icon: <BookOutlined />,
+          label: '院史待审',
+        },
       );
     }
 
@@ -53,6 +65,10 @@ export function AppLayout() {
         icon: <IdcardOutlined />,
         label: '用户中心',
       });
+    }
+
+    if (user) {
+      items.push({ key: '/history', icon: <BookOutlined />, label: '院史共编' });
     }
 
     if (hasRole(user, 'super_admin')) {
@@ -76,8 +92,17 @@ export function AppLayout() {
     if (location.pathname.startsWith('/admin/alumni')) {
       return ['/admin/alumni'];
     }
+    if (location.pathname.startsWith('/admin/audit')) {
+      return ['/admin/audit/changes'];
+    }
+    if (location.pathname.startsWith('/admin/history')) {
+      return ['/admin/history/reviews'];
+    }
     if (location.pathname.startsWith('/profile')) {
       return ['/profile'];
+    }
+    if (location.pathname.startsWith('/history')) {
+      return ['/history'];
     }
     return ['/alumni'];
   }, [location.pathname]);

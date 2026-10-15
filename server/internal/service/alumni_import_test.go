@@ -3,9 +3,13 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
+	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/dto"
+	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -49,6 +53,55 @@ func buildXLSXReader(headers []string, rows [][]string) (*bytes.Reader, error) {
 	return bytes.NewReader(buf.Bytes()), nil
 }
 
+func importAsSuperAdmin(svc *AlumniService, reader *bytes.Reader) (*dto.AlumniImportResult, error) {
+	domainID := uint64(1)
+	return svc.Import(context.Background(), common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin}, &domainID, reader)
+}
+
+type fakeImportDataDomainStore struct {
+	domains []*model.DataDomain
+}
+
+func (s *fakeImportDataDomainStore) ListActiveDataDomains(context.Context) ([]*model.DataDomain, error) {
+	return s.domains, nil
+}
+
+func (s *fakeImportDataDomainStore) ListAdminDataDomainIDs(context.Context, uint64) ([]uint64, error) {
+	return nil, nil
+}
+
+func (s *fakeImportDataDomainStore) ListAdminPermissionCodes(context.Context, uint64) ([]string, error) {
+	return nil, nil
+}
+
+func TestImportValidatesDataDomainPerRowForMultiDomainAdmin(t *testing.T) {
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{
+		{"本科生校友", "2020级", "", "", "", "", "", "", "", "", "", "", "", "", "", common.DataDomainUndergraduate},
+		{"MPA校友", "2020级", "", "", "", "", "", "", "", "", "", "", "", "", "", common.DataDomainMPA},
+		{"未知领域", "2020级", "", "", "", "", "", "", "", "", "", "", "", "", "", "unknown"},
+		{"空领域", "2020级"},
+	})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	svc := NewAlumniService(store, nil, &fakeImportDataDomainStore{domains: []*model.DataDomain{
+		{ID: 1, Code: common.DataDomainUndergraduate, Status: common.DataDomainStatusActive},
+		{ID: 2, Code: common.DataDomainMPA, Status: common.DataDomainStatusActive},
+	}})
+
+	result, err := svc.Import(context.Background(), common.AccessContext{UserID: 7, Role: common.RoleAdmin, DomainIDs: []uint64{1, 3}}, nil, reader)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 1 || len(result.Errors) != 3 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if len(store.batchProfiles) != 1 || store.batchProfiles[0].DataDomainID == nil || *store.batchProfiles[0].DataDomainID != 1 {
+		t.Fatalf("unexpected imported data domains: %+v", store.batchProfiles)
+	}
+}
+
 func TestImportAllValidRows(t *testing.T) {
 	headers := alumniColumnHeaders
 	rows := [][]string{
@@ -63,9 +116,9 @@ func TestImportAllValidRows(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -77,6 +130,84 @@ func TestImportAllValidRows(t *testing.T) {
 	}
 	if len(result.Errors) != 0 {
 		t.Fatalf("expected 0 errors, got %+v", result.Errors)
+	}
+}
+
+func TestImportWritesAuditWithoutProfileValues(t *testing.T) {
+	reader, err := buildXLSXReader(alumniColumnHeaders, [][]string{{"张三", "2020级", "", "", "", "", "", "", "", "山东大学"}})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	writer := &fakeExportOperationLogger{}
+	domainID := uint64(1)
+	svc := NewAlumniService(&fakeAlumniStore{}, nil).WithOperationLogger(writer)
+
+	result, err := svc.Import(context.Background(), common.AccessContext{UserID: 7, Role: common.RoleSuperAdmin}, &domainID, reader)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 1 || len(writer.logs) != 1 {
+		t.Fatalf("expected one successful import audit, result=%+v logs=%+v", result, writer.logs)
+	}
+	log := writer.logs[0]
+	if log.Action != AuditActionImport || log.TargetType != auditTargetBatch || log.OperatorID != 7 || log.OperatorRole != common.RoleSuperAdmin || log.Detail == nil {
+		t.Fatalf("unexpected import audit log: %+v", log)
+	}
+	if !strings.Contains(*log.Detail, "张三") {
+		t.Fatalf("import audit detail does not contain the created alumni name: %s", *log.Detail)
+	}
+	if strings.Contains(*log.Detail, "山东大学") {
+		t.Fatalf("import audit detail contains sensitive profile value: %s", *log.Detail)
+	}
+	var detail importAuditDetail
+	if err := json.Unmarshal([]byte(*log.Detail), &detail); err != nil {
+		t.Fatalf("parse import audit detail: %v", err)
+	}
+	if detail.Total != 1 || detail.Success != 1 || detail.Failed != 0 || len(detail.DataDomainIDs) != 1 || detail.DataDomainIDs[0] != domainID || !detail.SensitiveFieldsIncluded {
+		t.Fatalf("unexpected import audit detail: %+v", detail)
+	}
+	if len(detail.BatchCreatedAlumni) != 1 || detail.BatchCreatedAlumni[0].Name != "张三" {
+		t.Fatalf("expected created alumni in import detail: %+v", detail.BatchCreatedAlumni)
+	}
+	if _, ok := detail.BatchCreatedAlumni[0].FieldValues["work_unit"]; ok {
+		t.Fatalf("sensitive work unit was persisted in import detail: %+v", detail.BatchCreatedAlumni[0].FieldValues)
+	}
+}
+
+func TestImportForcesAssignedDataDomainAndReportsUnauthorizedSensitiveWrite(t *testing.T) {
+	reader, err := buildXLSXReader(alumniColumnHeaders, [][]string{{"张三", "2020级"}})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	svc := NewAlumniService(store, nil)
+	assignedDomainID := uint64(2)
+	_, err = svc.Import(context.Background(), common.AccessContext{
+		UserID:    7,
+		Role:      common.RoleAdmin,
+		DomainIDs: []uint64{assignedDomainID},
+	}, new(uint64), reader)
+	if err != nil {
+		t.Fatalf("expected import success, got %v", err)
+	}
+	if len(store.batchProfiles) != 1 || store.batchProfiles[0].DataDomainID == nil || *store.batchProfiles[0].DataDomainID != assignedDomainID {
+		t.Fatalf("expected imported profile to use assigned domain %d, got %+v", assignedDomainID, store.batchProfiles)
+	}
+
+	reader, err = buildXLSXReader(alumniColumnHeaders, [][]string{{"李四", "2020级", "", "", "", "", "", "", "", "", "主任"}})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	result, err := svc.Import(context.Background(), common.AccessContext{
+		UserID:    7,
+		Role:      common.RoleAdmin,
+		DomainIDs: []uint64{assignedDomainID},
+	}, nil, reader)
+	if err != nil {
+		t.Fatalf("expected partial import result, got %v", err)
+	}
+	if result.Success != 0 || len(result.Errors) != 1 || result.Errors[0].Row != 2 || result.Errors[0].Message != "无权导入敏感字段" {
+		t.Fatalf("expected sensitive row error, got %+v", result)
 	}
 }
 
@@ -93,9 +224,9 @@ func TestImportKeepsRowsWithDifferentMobile(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -120,9 +251,9 @@ func TestImportDeduplicatesRowsWithSameMobile(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -147,9 +278,9 @@ func TestImportDeduplicatesRowsWithPaddedMobile(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -174,9 +305,9 @@ func TestImportDeduplicatesRowsWithEmptyMobile(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -202,9 +333,9 @@ func TestImportPartialErrors(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success (partial), got %v", err)
 	}
@@ -227,11 +358,22 @@ func TestImportEmptyFile(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	_, err = svc.Import(context.Background(), 1, reader)
+	_, err = importAsSuperAdmin(svc, reader)
 	if err == nil {
 		t.Fatal("expected error for empty file")
+	}
+}
+
+func TestImportRejectsMalformedWorkbook(t *testing.T) {
+	// A ZIP signature alone must not be treated as a valid workbook. This also
+	// guards the import path against malformed uploaded spreadsheet data.
+	reader := bytes.NewReader([]byte{'P', 'K', 0x03, 0x04, 0xff, 0x00, 0x00})
+
+	_, err := importAsSuperAdmin(NewAlumniService(&fakeAlumniStore{}, nil), reader)
+	if err != common.ErrInvalidRequest {
+		t.Fatalf("expected invalid request for malformed workbook, got %v", err)
 	}
 }
 
@@ -243,9 +385,9 @@ func TestImportHeaderMismatch(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	_, err = svc.Import(context.Background(), 1, reader)
+	_, err = importAsSuperAdmin(svc, reader)
 	if err == nil {
 		t.Fatal("expected error for header mismatch")
 	}
@@ -259,9 +401,9 @@ func TestImportDatabaseUnavailable(t *testing.T) {
 		t.Fatalf("failed to build xlsx: %v", err)
 	}
 
-	svc := NewAlumniService(nil, nil, nil)
+	svc := NewAlumniService(nil, nil)
 
-	_, err = svc.Import(context.Background(), 1, reader)
+	_, err = importAsSuperAdmin(svc, reader)
 	if err != common.ErrDatabaseUnavailable {
 		t.Fatalf("expected database unavailable, got %v", err)
 	}
@@ -333,9 +475,9 @@ func TestImportResultErrorsIncludeRowNumbers(t *testing.T) {
 	}
 
 	store := &fakeAlumniStore{}
-	svc := NewAlumniService(store, nil, nil)
+	svc := NewAlumniService(store, nil)
 
-	result, err := svc.Import(context.Background(), 1, reader)
+	result, err := importAsSuperAdmin(svc, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}

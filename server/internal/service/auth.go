@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdmail "net/mail"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -318,8 +319,11 @@ func resolveCodeSender(cfg config.Config) CodeSender {
 type AuthService struct {
 	users         repository.UserStore
 	alumni        repository.AlumniStore
+	opLogger      *OperationLogger
+	auditWriter   AuditEventWriter
 	loginAttempts repository.LoginAttemptStore
 	verifyCode    repository.VerifyCodeStore
+	access        repository.AccessControlStore
 	codeSender    CodeSender
 	cfg           config.Config
 	jwtSecret     []byte
@@ -334,8 +338,9 @@ func NewAuthService(
 	loginAttempts repository.LoginAttemptStore,
 	verifyCode repository.VerifyCodeStore,
 	cfg config.Config,
+	access ...repository.AccessControlStore,
 ) *AuthService {
-	return &AuthService{
+	service := &AuthService{
 		users:         users,
 		alumni:        alumni,
 		loginAttempts: loginAttempts,
@@ -347,6 +352,23 @@ func NewAuthService(
 		issuer:        cfg.App.Name,
 		now:           time.Now,
 	}
+	if len(access) > 0 {
+		service.access = access[0]
+	}
+	return service
+}
+
+// WithOperationLogger 注入操作历史写入器，用于记录校友本人修改联系方式。
+func (s *AuthService) WithOperationLogger(l *OperationLogger) *AuthService {
+	s.opLogger = l
+	s.auditWriter = l
+	return s
+}
+
+// WithAuditWriter 注入校友本人修改联系方式时使用的审计事件写入器。
+func (s *AuthService) WithAuditWriter(writer AuditEventWriter) *AuthService {
+	s.auditWriter = writer
+	return s
 }
 
 // detectLoginType classifies an identifier string.
@@ -370,6 +392,55 @@ func (s *AuthService) Login(ctx context.Context, req dto.LoginRequest) (*dto.Log
 	default:
 		return s.loginWithPassword(ctx, req)
 	}
+}
+
+// CurrentUser 返回当前请求的用户资料与已生效授权能力。
+func (s *AuthService) CurrentUser(ctx context.Context, access common.AccessContext) (*dto.UserDTO, error) {
+	if s.users == nil || s.access == nil {
+		return nil, common.ErrDatabaseUnavailable
+	}
+	user, err := s.users.FindByID(ctx, access.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if user.Status != common.UserStatusActive {
+		return nil, common.ErrAccountDisabled
+	}
+
+	result := userDTOFromModel(user)
+	result.Domains = []dto.AdminDataDomain{}
+	result.Permissions = []string{}
+	if !access.IsAdministrator() {
+		return &result, nil
+	}
+
+	activeDomains, err := s.access.ListActiveDataDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if access.IsSuperAdmin() {
+		result.Domains = mapAdminDataDomains(activeDomains)
+		result.Permissions = allAdminPermissions()
+		return &result, nil
+	}
+	allowed := make(map[uint64]struct{}, len(access.DomainIDs))
+	for _, id := range access.DomainIDs {
+		allowed[id] = struct{}{}
+	}
+	for _, domain := range activeDomains {
+		if domain != nil {
+			if _, ok := allowed[domain.ID]; ok {
+				result.Domains = append(result.Domains, dto.AdminDataDomain{ID: domain.ID, Code: domain.Code, Name: domain.Name})
+			}
+		}
+	}
+	for permission := range access.Permissions {
+		if common.IsKnownAdminPermission(permission) {
+			result.Permissions = append(result.Permissions, permission)
+		}
+	}
+	sort.Strings(result.Permissions)
+	return &result, nil
 }
 
 func (s *AuthService) loginWithPassword(ctx context.Context, req dto.LoginRequest) (*dto.LoginResult, error) {
@@ -531,7 +602,7 @@ func (s *AuthService) createUserForAlumni(ctx context.Context, mobile, email str
 
 	var realName *string
 	if s.alumni != nil {
-		if profile, err := s.alumni.GetByID(ctx, alumniID); err == nil {
+		if profile, err := s.alumni.GetByID(ctx, alumniID, nil); err == nil {
 			realName = &profile.Name
 		}
 	}
@@ -579,15 +650,12 @@ func (s *AuthService) completeLogin(ctx context.Context, user *model.User, ident
 		AccessToken: token,
 		TokenType:   "Bearer",
 		ExpiresAt:   expiresAt,
-		User: dto.UserDTO{
-			ID:       user.ID,
-			Account:  user.Account,
-			Role:     user.Role,
-			RealName: user.RealName,
-			AlumniID: user.AlumniID,
-			Mobile:   user.Mobile,
-		},
+		User:        userDTOFromModel(user),
 	}, nil
+}
+
+func userDTOFromModel(user *model.User) dto.UserDTO {
+	return dto.UserDTO{ID: user.ID, Account: user.Account, Role: user.Role, RealName: user.RealName, AlumniID: user.AlumniID, Mobile: user.Mobile, Domains: []dto.AdminDataDomain{}, Permissions: []string{}}
 }
 
 // SendVerifyCode sends a verification code.
@@ -657,7 +725,7 @@ func generateCode(cfg config.Config, sender CodeSender, isPhone, isEmail bool) s
 }
 
 // UpdateContact updates the alumni's phone and/or email with code verification.
-func (s *AuthService) UpdateContact(ctx context.Context, userID uint64, req dto.UpdateContactRequest) error {
+func (s *AuthService) UpdateContact(ctx context.Context, userID uint64, req dto.UpdateContactRequest) (err error) {
 	user, err := s.users.FindByID(ctx, userID)
 	if errors.Is(err, common.ErrUserNotFound) {
 		return common.ErrUserNotFound
@@ -670,6 +738,32 @@ func (s *AuthService) UpdateContact(ctx context.Context, userID uint64, req dto.
 	}
 	if req.Mobile == nil && req.Email == nil {
 		return common.ErrInvalidRequest
+	}
+
+	var before *model.AlumniProfile
+	if s.auditWriter != nil && user.AlumniID != nil && s.alumni != nil {
+		before, _ = s.alumni.GetByID(ctx, *user.AlumniID, nil)
+		defer func() {
+			if before == nil {
+				return
+			}
+			after, fetchErr := s.alumni.GetByID(ctx, *user.AlumniID, nil)
+			if fetchErr != nil {
+				return
+			}
+			writeProfileAudit(
+				ctx,
+				s.auditWriter,
+				s.users,
+				userID,
+				"update",
+				"alumni_self",
+				"校友本人修改联系方式",
+				defaultAuditScope,
+				before,
+				after,
+			)
+		}()
 	}
 
 	currentMobile := strOrEmpty(user.Mobile)
@@ -832,9 +926,7 @@ func (s *AuthService) SetupPassword(ctx context.Context, req dto.SetupPasswordRe
 
 type customClaims struct {
 	jwt.RegisteredClaims
-	UID     uint64 `json:"uid"`
-	Account string `json:"account"`
-	Role    string `json:"role"`
+	UID uint64 `json:"uid"`
 }
 
 type registrationClaims struct {
@@ -878,9 +970,7 @@ func (s *AuthService) issueAccessToken(user *model.User, issuedAt, expiresAt tim
 			IssuedAt:  jwt.NewNumericDate(issuedAt),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 		},
-		UID:     user.ID,
-		Account: user.Account,
-		Role:    user.Role,
+		UID: user.ID,
 	}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.jwtSecret)
 	if err != nil {

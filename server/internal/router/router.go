@@ -51,17 +51,22 @@ func New(deps Dependencies) *gin.Engine {
 	healthHandler := handler.NewHealthHandler(deps.Config, deps.DB, deps.RedisClient)
 	// 用户仓库
 	userRepository := repository.NewUserRepository(deps.DB)
+	// 管理员数据域和功能权限仓库
+	accessControlRepository := repository.NewAccessControlRepository(deps.DB)
+	// 请求级授权上下文加载器
+	accessContextLoader := middleware.NewAccessContextLoader(userRepository, accessControlRepository)
 	// 校友仓库
 	alumniRepository := repository.NewAlumniRepository(deps.DB)
+	// 操作日志写入器
+	opLogger := service.NewOperationLogger(deps.DB)
 	// 登录尝试仓库
 	loginAttemptRepository := repository.NewLoginAttemptRepository(deps.RedisClient)
 	// 验证码仓库
 	verifyCodeRepository := repository.NewVerifyCodeStore(deps.RedisClient)
 	// 认证服务和处理器
-	authService := service.NewAuthService(userRepository, alumniRepository, loginAttemptRepository, verifyCodeRepository, deps.Config)
+	authService := service.NewAuthService(userRepository, alumniRepository, loginAttemptRepository, verifyCodeRepository, deps.Config, accessControlRepository).
+		WithOperationLogger(opLogger)
 	authHandler := handler.NewAuthHandler(authService)
-	// 操作日志写入器
-	opLogger := service.NewOperationLogger(deps.DB)
 	// 校友文件仓库、服务和处理器（仅存储启用时注册）
 	var alumniFileHandler *handler.AlumniFileHandler
 	var alumniFileCleaner service.AlumniFileCleaner
@@ -72,13 +77,23 @@ func New(deps Dependencies) *gin.Engine {
 		alumniFileCleaner = alumniFileService
 	}
 	// 校友服务和处理器（注入文件服务以支持级联删除）
-	alumniService := service.NewAlumniService(alumniRepository, userRepository, alumniFileCleaner).
+	alumniService := service.NewAlumniService(alumniRepository, alumniFileCleaner, accessControlRepository).
 		WithCountCache(cache.NewCountCache(deps.RedisClient)).
-		WithExportCache(cache.NewExportCache(deps.RedisClient))
+		WithExportCache(cache.NewExportCache(deps.RedisClient)).
+		WithAuditUserStore(userRepository).
+		WithOperationLogger(opLogger)
 	alumniHandler := handler.NewAlumniHandler(alumniService)
+	// 操作历史查询服务
+	auditRepository := repository.NewAuditRepository(deps.DB)
+	auditService := service.NewAuditService(auditRepository, alumniRepository)
+	auditHandler := handler.NewAuditHandler(auditService)
 	// 超级管理员服务和处理器
-	adminService := service.NewAdminService(userRepository)
+	adminService := service.NewAdminService(userRepository, accessControlRepository)
 	adminHandler := handler.NewAdminHandler(adminService)
+	// 院史共编：复用现有认证与数据域授权。
+	historyRepository := repository.NewHistoryRepository(deps.DB)
+	historyService := service.NewHistoryService(historyRepository, deps.StorageClient)
+	historyHandler := handler.NewHistoryHandler(historyService)
 	// 数据大屏服务和处理器
 	dashboardRepository := repository.NewDashboardRepository(deps.DB)
 	dashboardService := service.NewDashboardService(dashboardRepository)
@@ -93,7 +108,10 @@ func New(deps Dependencies) *gin.Engine {
 	}
 
 	api := engine.Group("/api/v1")
-	api.Use(middleware.Auth(authService, whiteList...))
+	api.Use(
+		middleware.Auth(authService, whiteList...),
+		middleware.LoadAccessContext(accessContextLoader, whiteList...),
+	)
 	{
 		// 健康检查
 		api.GET("/health/live", healthHandler.Live)
@@ -101,6 +119,7 @@ func New(deps Dependencies) *gin.Engine {
 
 		// 用户认证
 		api.POST("/auth/login", authHandler.Login)
+		api.GET("/auth/me", authHandler.Me)
 		api.POST("/auth/logout", authHandler.Logout)
 		api.POST("/auth/change-password", authHandler.ChangePassword)
 		api.POST("/auth/setup-password", authHandler.SetupPassword)
@@ -113,9 +132,32 @@ func New(deps Dependencies) *gin.Engine {
 		api.PUT("/alumni/me/contact", authHandler.UpdateContact)
 		api.GET("/alumni/:id", alumniHandler.Detail)
 
+		// 院史共编（所有接口均需已登录；投稿与审核均由服务层校验角色和数据域）
+		history := api.Group("/history")
+		{
+			history.GET("/entries", historyHandler.ListEntries)
+			history.GET("/entries/:id", historyHandler.GetEntry)
+			history.PUT("/entries/:id", historyHandler.UpdateEntry)
+			history.GET("/contributions/me", historyHandler.ListMine)
+			history.GET("/contributions/:id", historyHandler.GetContribution)
+			history.POST("/contributions", historyHandler.CreateDraft)
+			history.PUT("/contributions/:id", historyHandler.UpdateContribution)
+			history.DELETE("/contributions/:id", historyHandler.DeleteDraft)
+			history.POST("/contributions/:id/submit", historyHandler.Submit)
+			history.POST("/contributions/:id/attachments/upload-url", historyHandler.RequestAttachmentUpload)
+			history.POST("/contributions/:id/attachments/:attachmentId/confirm", historyHandler.ConfirmAttachmentUpload)
+			history.DELETE("/contributions/:id/attachments/:attachmentId", historyHandler.DeleteAttachment)
+			history.PUT("/contributions/:id/attachments/:attachmentId", historyHandler.UpdateAttachment)
+			history.GET("/contributions/:id/attachments", historyHandler.ListAttachments)
+			history.GET("/contributions/:id/attachments/:attachmentId/download", historyHandler.AttachmentDownloadURL)
+			history.GET("/reviews", historyHandler.ListPending)
+			history.GET("/reviews/:id/attachments", historyHandler.ListAttachments)
+			history.POST("/reviews/:id", historyHandler.Review)
+		}
+
 		// 管理员专用接口
 		admin := api.Group("/admin")
-		admin.Use(middleware.RequireRoles(userRepository, common.RoleAdmin, common.RoleSuperAdmin))
+		admin.Use(middleware.RequireRoles(common.RoleAdmin, common.RoleSuperAdmin))
 		{
 			// 管理校友信息
 			admin.POST("/alumni", alumniHandler.Create)
@@ -124,6 +166,10 @@ func New(deps Dependencies) *gin.Engine {
 			admin.POST("/alumni/import", alumniHandler.Import)
 			admin.GET("/alumni/export", alumniHandler.Export)
 			admin.GET("/alumni/template", alumniHandler.ExportTemplate)
+
+			// 操作历史（只读，管理员及以上可访问）
+			admin.GET("/audit/operations", auditHandler.List)
+			admin.GET("/audit/operations/:id", auditHandler.Detail)
 
 			// 管理校友文件（仅存储启用时注册）
 			if alumniFileHandler != nil {
@@ -141,12 +187,15 @@ func New(deps Dependencies) *gin.Engine {
 
 		// 超级管理员专用接口
 		superAdmin := api.Group("/super-admin")
-		superAdmin.Use(middleware.RequireRoles(userRepository, common.RoleSuperAdmin))
+		superAdmin.Use(middleware.RequireRoles(common.RoleSuperAdmin))
 		{
 			// 管理员账号管理
 			superAdmin.GET("/admins", adminHandler.List)
 			superAdmin.POST("/admins", adminHandler.Create)
+			superAdmin.GET("/admins/:id", adminHandler.Detail)
+			superAdmin.PUT("/admins/:id/access", adminHandler.ReplaceAccess)
 			superAdmin.DELETE("/admins/:id", adminHandler.Delete)
+			superAdmin.GET("/data-domains", adminHandler.ListDataDomains)
 		}
 	}
 

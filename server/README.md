@@ -66,7 +66,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Compose 会将 MySQL 容器的 `3306` 端口映射到本机 `3307`，并在首次创建数据卷时执行 `server/migrations` 下的 SQL 初始化脚本。
+Compose 会将 MySQL 容器的 `3306` 端口映射到本机 `3307`。MySQL 在首次创建数据卷时执行 `server/migrations` 下的 SQL 初始化脚本；随后 `migrate` 服务会在 API 启动前应用尚未记录的增量迁移，因此保留的数据卷也能获得新表和新字段。
 
 启动后可检查：
 

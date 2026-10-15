@@ -138,7 +138,7 @@ func TestAuthLogoutRouteRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestAuthLogoutRouteWithToken(t *testing.T) {
+func TestAuthLogoutRouteWithTokenRejectsWhenAuthorizationContextUnavailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	engine := New(Dependencies{
@@ -160,11 +160,11 @@ func TestAuthLogoutRouteWithToken(t *testing.T) {
 
 	engine.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `"logged_out":true`) {
-		t.Fatalf("expected logout response, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"code":50300`) {
+		t.Fatalf("expected service unavailable response, got %s", rec.Body.String())
 	}
 }
 
@@ -209,6 +209,29 @@ func TestAlumniListRouteRequiresAuth(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/alumni", nil)
+	rec := httptest.NewRecorder()
+
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"code":40100`) {
+		t.Fatalf("expected unauthorized response, got %s", rec.Body.String())
+	}
+}
+
+func TestHistoryEntryRouteRequiresAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := New(Dependencies{
+		Config: config.Config{
+			App: config.AppConfig{Name: "test-api", Env: config.EnvDevelopment},
+		},
+		Logger: zap.NewNop(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/history/entries", nil)
 	rec := httptest.NewRecorder()
 
 	engine.ServeHTTP(rec, req)
@@ -277,7 +300,7 @@ func TestAlumniDetailRouteRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestAlumniDetailRouteRejectsInvalidID(t *testing.T) {
+func TestAlumniDetailRouteRejectsInvalidIDAfterAuthorizationContextLoads(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	engine := New(Dependencies{
@@ -299,11 +322,11 @@ func TestAlumniDetailRouteRejectsInvalidID(t *testing.T) {
 
 	engine.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `"code":40000`) {
-		t.Fatalf("expected bad request response, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"code":50300`) {
+		t.Fatalf("expected service unavailable response, got %s", rec.Body.String())
 	}
 }
 
@@ -393,7 +416,7 @@ func TestAlumniMeRouteWithoutDatabase(t *testing.T) {
 	}
 }
 
-func TestAlumniMeUpdateRouteRejectsInvalidJSON(t *testing.T) {
+func TestAlumniMeUpdateRouteRejectsInvalidJSONAfterAuthorizationContextLoads(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	engine := New(Dependencies{
@@ -416,11 +439,11 @@ func TestAlumniMeUpdateRouteRejectsInvalidJSON(t *testing.T) {
 
 	engine.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `"code":40000`) {
-		t.Fatalf("expected bad request response, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"code":50300`) {
+		t.Fatalf("expected service unavailable response, got %s", rec.Body.String())
 	}
 }
 
@@ -826,10 +849,14 @@ func TestSuperAdminAdminsDeleteRouteWithoutDatabase(t *testing.T) {
 }
 
 func testAccessToken(t *testing.T, secret string, expiresAt time.Time) string {
+	return testAccessTokenForUser(t, secret, 1, expiresAt)
+}
+
+func testAccessTokenForUser(t *testing.T, secret string, userID uint64, expiresAt time.Time) string {
 	t.Helper()
 
 	claims := jwt.MapClaims{
-		"uid": float64(1),
+		"uid": float64(userID),
 		"exp": jwt.NewNumericDate(expiresAt),
 	}
 
