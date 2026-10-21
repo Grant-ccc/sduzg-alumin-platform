@@ -67,6 +67,18 @@ services:
 
 以上约定基于现有数据已经存储为 UTC，不会改写历史记录。如果自定义部署曾以本地时间写入 `DATETIME`，应先备份并核实数据的真实时区，再制定单独的数据校正方案，不能直接批量加减 8 小时。
 
+## 静态资源与缓存策略
+
+Web 容器（`web/nginx.conf`）的缓存策略决定发版后用户能否立刻拿到新前端：
+
+- `/index.html`、根路径与 SPA 深层路由回退：`Cache-Control: no-cache`。允许缓存，但每次使用前向服务器校验，配合 ETag 命中时返回 304。
+- `/assets/`：`Cache-Control: public, max-age=31536000, immutable`。Vite 产物文件名带内容 hash，内容变化会生成新文件名，因此可以长期缓存。
+- `/api/`、`/sdu-alumni-files/` 是代理路径，不要给它们加缓存头。
+
+注意 nginx 的 `add_header` **不继承**：某个 location 内出现 `add_header` 后，上层/server 级同类指令会被整体覆盖。不要在 server 级统一加缓存头，否则代理路径也会被误加；新增 location 时应单独声明所需头部。
+
+CI 的 `containers` 任务会启动 Web 镜像，断言上述响应头以及 `If-None-Match` 返回 304（`.github/workflows/ci.yml` 的 `Verify web container serves the built application`）。修改缓存策略时要同步更新断言，不要只删除头部。`server_tokens off;` 用于隐藏 nginx 版本号。
+
 ## 在线接口文档
 
 Swagger UI 挂在 API 服务的 `/swagger/index.html`，接口规范端点为 `/swagger/doc.json`。它可以浏览全部接口、查看参数与响应结构，并在 Authorize 中填入 `Bearer <access_token>` 后直接发起真实请求；这些请求与手工调用一样受登录、角色、数据域和功能权限校验，不会因为从文档发起而放宽。[接口文档](api.md)是接口约定的文字说明，两者内容一致。文档只由 API 服务提供，Web 容器（默认 80 端口）不代理该路径：从 Web 入口访问 `/swagger/index.html` 只会返回前端页面，请直接访问上表中的 API 地址。
