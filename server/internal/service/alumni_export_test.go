@@ -537,3 +537,65 @@ func TestMaskedExportRoundTripCanCreateDuplicate(t *testing.T) {
 		t.Fatalf("expected the masked row to create a duplicate, got %+v", result)
 	}
 }
+
+func TestCSVExportRoundTripsIntoImport(t *testing.T) {
+	domains := testDataDomainStore()
+	exportStore := &fakeAlumniStore{items: []*model.AlumniProfile{
+		{ID: 1, DataDomainID: 2, Name: "=SUM(A1:A2)", Grade: "2020级", ClassName: new("Formula-Class")},
+	}}
+	exported, err := exportAsSuperAdmin(NewAlumniService(exportStore, nil, domains), dto.AlumniExportRequest{Format: "csv"})
+	if err != nil {
+		t.Fatalf("csv export failed: %v", err)
+	}
+
+	importStore := &fakeAlumniStore{}
+	result, err := NewAlumniService(importStore, nil, domains).Import(
+		context.Background(),
+		common.AccessContext{UserID: 9, Role: common.RoleSuperAdmin},
+		nil,
+		bytes.NewReader(exported.Data),
+	)
+	if err != nil {
+		t.Fatalf("CSV export should be importable, got %v", err)
+	}
+	if result.Success != 1 || len(importStore.batchProfiles) != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if name := importStore.batchProfiles[0].Name; name != "=SUM(A1:A2)" {
+		t.Fatalf("formula guard prefix was not restored: %q", name)
+	}
+	if domain := importStore.batchProfiles[0].DataDomainID; domain == nil || *domain != 2 {
+		t.Fatalf("data domain = %v, want 2", domain)
+	}
+}
+
+func TestFormulaGuardRoundTripIsSymmetric(t *testing.T) {
+	domains := testDataDomainStore()
+	exportStore := &fakeAlumniStore{items: []*model.AlumniProfile{
+		{ID: 1, DataDomainID: 1, Name: "'=SUM(A1:A2)", Grade: "2020级"},
+	}}
+	exported, err := exportAsSuperAdmin(NewAlumniService(exportStore, nil, domains), dto.AlumniExportRequest{Format: "csv"})
+	if err != nil {
+		t.Fatalf("csv export failed: %v", err)
+	}
+	records, err := csv.NewReader(bytes.NewReader(exported.Data[3:])).ReadAll()
+	if err != nil {
+		t.Fatalf("read exported csv: %v", err)
+	}
+	if records[1][0] != "''=SUM(A1:A2)" {
+		t.Fatalf("export should add one guard layer, got %q", records[1][0])
+	}
+
+	importStore := &fakeAlumniStore{}
+	if _, err := NewAlumniService(importStore, nil, domains).Import(
+		context.Background(),
+		common.AccessContext{UserID: 9, Role: common.RoleSuperAdmin},
+		nil,
+		bytes.NewReader(exported.Data),
+	); err != nil {
+		t.Fatalf("import exported csv: %v", err)
+	}
+	if name := importStore.batchProfiles[0].Name; name != "'=SUM(A1:A2)" {
+		t.Fatalf("formula guard should be symmetric, got %q", name)
+	}
+}
