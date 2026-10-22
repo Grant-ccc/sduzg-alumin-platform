@@ -23,10 +23,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       const response = await authApi.login(payload);
       cacheAccessToken(response.access_token);
-      set({ user: response.user, sessionChecked: true, loading: false });
-      return response.user;
+      const currentUser = await authApi.me();
+      set({ user: currentUser, sessionChecked: true, loading: false });
+      return currentUser;
     } catch (error) {
-      set({ loading: false });
+      cacheAccessToken(null);
+      set({ user: null, sessionChecked: true, loading: false });
       throw error;
     }
   },

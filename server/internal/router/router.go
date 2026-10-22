@@ -69,6 +69,7 @@ func New(deps Dependencies) *gin.Engine {
 
 	api := engine.Group("/api/v1")
 	api.Use(middleware.Auth(authService, whiteList...))
+	api.Use(middleware.LoadCurrentUser(userRepository, whiteList...))
 	{
 		// 健康检查
 		api.GET("/health/live", healthHandler.Live)
@@ -76,6 +77,7 @@ func New(deps Dependencies) *gin.Engine {
 
 		// 用户认证
 		api.POST("/auth/login", authHandler.Login)
+		api.GET("/auth/me", authHandler.Me)
 		api.POST("/auth/logout", authHandler.Logout)
 		api.POST("/auth/change-password", authHandler.ChangePassword)
 
@@ -87,7 +89,7 @@ func New(deps Dependencies) *gin.Engine {
 
 		// 管理员专用接口
 		admin := api.Group("/admin")
-		admin.Use(middleware.RequireRoles(userRepository, common.RoleAdmin, common.RoleSuperAdmin))
+		admin.Use(middleware.RequireRoles(common.RoleAdmin, common.RoleSuperAdmin))
 		{
 			// 管理校友信息
 			admin.POST("/alumni", alumniHandler.Create)
@@ -101,7 +103,7 @@ func New(deps Dependencies) *gin.Engine {
 
 		// 超级管理员专用接口
 		superAdmin := api.Group("/super-admin")
-		superAdmin.Use(middleware.RequireRoles(userRepository, common.RoleSuperAdmin))
+		superAdmin.Use(middleware.RequireRoles(common.RoleSuperAdmin))
 		{
 			// 管理员账号管理
 			superAdmin.GET("/admins", adminHandler.List)

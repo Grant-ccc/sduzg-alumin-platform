@@ -28,9 +28,10 @@ func TestRequireRolesAllowsAdmin(t *testing.T) {
 		c.Set(CurrentUserIDKey, uint64(1))
 		c.Next()
 	})
-	engine.Use(RequireRoles(fakeRoleUserStore{
+	engine.Use(LoadCurrentUser(fakeRoleUserStore{
 		user: &model.User{ID: 1, Role: common.RoleAdmin, Status: common.UserStatusActive},
-	}, common.RoleAdmin, common.RoleSuperAdmin))
+	}))
+	engine.Use(RequireRoles(common.RoleAdmin, common.RoleSuperAdmin))
 	engine.GET("/admin/alumni", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
@@ -53,9 +54,10 @@ func TestRequireRolesRejectsAlumni(t *testing.T) {
 		c.Set(CurrentUserIDKey, uint64(1))
 		c.Next()
 	})
-	engine.Use(RequireRoles(fakeRoleUserStore{
+	engine.Use(LoadCurrentUser(fakeRoleUserStore{
 		user: &model.User{ID: 1, Role: common.RoleAlumni, Status: common.UserStatusActive},
-	}, common.RoleAdmin, common.RoleSuperAdmin))
+	}))
+	engine.Use(RequireRoles(common.RoleAdmin, common.RoleSuperAdmin))
 	engine.GET("/admin/alumni", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
@@ -78,9 +80,10 @@ func TestRequireRolesMapsDatabaseUnavailable(t *testing.T) {
 		c.Set(CurrentUserIDKey, uint64(1))
 		c.Next()
 	})
-	engine.Use(RequireRoles(fakeRoleUserStore{
+	engine.Use(LoadCurrentUser(fakeRoleUserStore{
 		err: common.ErrDatabaseUnavailable,
-	}, common.RoleAdmin, common.RoleSuperAdmin))
+	}))
+	engine.Use(RequireRoles(common.RoleAdmin, common.RoleSuperAdmin))
 	engine.GET("/admin/alumni", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})

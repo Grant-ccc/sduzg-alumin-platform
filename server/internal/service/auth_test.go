@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -273,6 +275,28 @@ func TestAuthServiceLogout(t *testing.T) {
 	}
 	if !result.LoggedOut {
 		t.Fatal("expected logged out result")
+	}
+}
+
+func TestIssuedAccessTokenDoesNotContainRole(t *testing.T) {
+	svc := NewAuthService(nil, nil, config.Config{Auth: config.AuthConfig{JWTSecret: "test-secret"}})
+	token, err := svc.issueAccessToken(&model.User{ID: 1, Role: common.RoleSuperAdmin}, time.Now(), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.Split(token, ".")[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := claims["role"]; exists {
+		t.Fatal("role must be read from the database, not persisted in a client token")
+	}
+	if claims["uid"] != float64(1) {
+		t.Fatalf("missing user identity: %s", decoded)
 	}
 }
 

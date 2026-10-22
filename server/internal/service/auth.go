@@ -229,7 +229,6 @@ func (s *AuthService) issueAccessToken(user *model.User, issuedAt time.Time, exp
 		"sub":     strconv.FormatUint(user.ID, 10),
 		"uid":     user.ID,
 		"account": user.Account,
-		"role":    user.Role,
 		"iss":     s.issuer,
 		"iat":     issuedAt.Unix(),
 		"exp":     expiresAt.Unix(),

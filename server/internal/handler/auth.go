@@ -48,6 +48,22 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 }
 
+// Me 仅返回服务端已验证的当前用户资料，不暴露密码哈希等数据库字段。
+func (h *AuthHandler) Me(c *gin.Context) {
+	user, ok := middleware.CurrentUser(c)
+	if !ok {
+		response.Fail(c, http.StatusUnauthorized, response.CodeUnauthorized, "unauthorized")
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	response.Success(c, dto.UserDTO{
+		ID:       user.ID,
+		Account:  user.Account,
+		Role:     user.Role,
+		RealName: user.RealName,
+	})
+}
+
 func (h *AuthHandler) Logout(c *gin.Context) {
 	result, err := h.auth.Logout(c.Request.Context())
 	if err != nil {

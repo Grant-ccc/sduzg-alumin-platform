@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/config"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -109,7 +110,7 @@ func TestAuthLogoutRouteRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestAuthLogoutRouteWithToken(t *testing.T) {
+func TestAuthLogoutRouteWithoutDatabase(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	engine := New(Dependencies{
@@ -131,11 +132,8 @@ func TestAuthLogoutRouteWithToken(t *testing.T) {
 
 	engine.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), `"logged_out":true`) {
-		t.Fatalf("expected logout response, got %s", rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected database validation before logout, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -249,20 +247,8 @@ func TestAlumniDetailRouteRequiresAuth(t *testing.T) {
 }
 
 func TestAlumniDetailRouteRejectsInvalidID(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	engine := New(Dependencies{
-		Config: config.Config{
-			App: config.AppConfig{
-				Name: "test-api",
-				Env:  config.EnvDevelopment,
-			},
-			Auth: config.AuthConfig{
-				JWTSecret: "test-secret",
-			},
-		},
-		Logger: zap.NewNop(),
-	})
+	engine, mock := authorizationRouter(t)
+	expectDatabaseUser(mock, common.RoleAlumni, common.UserStatusActive)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/alumni/not-a-number", nil)
 	req.Header.Set("Authorization", "Bearer "+testAccessToken(t, "test-secret", time.Now().Add(time.Hour)))
@@ -365,20 +351,8 @@ func TestAlumniMeRouteWithoutDatabase(t *testing.T) {
 }
 
 func TestAlumniMeUpdateRouteRejectsInvalidJSON(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	engine := New(Dependencies{
-		Config: config.Config{
-			App: config.AppConfig{
-				Name: "test-api",
-				Env:  config.EnvDevelopment,
-			},
-			Auth: config.AuthConfig{
-				JWTSecret: "test-secret",
-			},
-		},
-		Logger: zap.NewNop(),
-	})
+	engine, mock := authorizationRouter(t)
+	expectDatabaseUser(mock, common.RoleAlumni, common.UserStatusActive)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/alumni/me", strings.NewReader(`{`))
 	req.Header.Set("Authorization", "Bearer "+testAccessToken(t, "test-secret", time.Now().Add(time.Hour)))
@@ -796,7 +770,7 @@ func TestSuperAdminAdminsDeleteRouteWithoutDatabase(t *testing.T) {
 	}
 }
 
-func testAccessToken(t *testing.T, secret string, expiresAt time.Time) string {
+func testAccessToken(t *testing.T, secret string, expiresAt time.Time, role ...string) string {
 	t.Helper()
 
 	encoder := base64.RawURLEncoding
@@ -807,10 +781,14 @@ func testAccessToken(t *testing.T, secret string, expiresAt time.Time) string {
 	if err != nil {
 		t.Fatalf("failed to marshal token header: %v", err)
 	}
-	payload, err := json.Marshal(map[string]any{
+	claims := map[string]any{
 		"uid": 1,
 		"exp": expiresAt.Unix(),
-	})
+	}
+	if len(role) > 0 {
+		claims["role"] = role[0]
+	}
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatalf("failed to marshal token payload: %v", err)
 	}
