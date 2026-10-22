@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -65,6 +66,10 @@ type fakeImportDataDomainStore struct {
 }
 
 func (s *fakeImportDataDomainStore) ListActiveDataDomains(context.Context) ([]*model.DataDomain, error) {
+	return s.domains, nil
+}
+
+func (s *fakeImportDataDomainStore) ListDataDomains(context.Context) ([]*model.DataDomain, error) {
 	return s.domains, nil
 }
 
@@ -253,7 +258,7 @@ func TestImportForcesAssignedDataDomainAndReportsUnauthorizedSensitiveWrite(t *t
 		UserID:    7,
 		Role:      common.RoleAdmin,
 		DomainIDs: []uint64{assignedDomainID},
-	}, new(uint64), reader)
+	}, nil, reader)
 	if err != nil {
 		t.Fatalf("expected import success, got %v", err)
 	}
@@ -560,5 +565,296 @@ func TestImportResultErrorsIncludeRowNumbers(t *testing.T) {
 	}
 	if result.Errors[2].Row != 5 {
 		t.Fatalf("expected third error at row 5, got %d", result.Errors[2].Row)
+	}
+}
+
+func TestImportAcceptsDataDomainCodeNameAndID(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "code", value: "mpa"},
+		{name: "code is case insensitive", value: "MPA"},
+		{name: "display name", value: "MPA专业学位研究生"},
+		{name: "numeric id", value: "2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := make([]string, len(alumniImportColumnHeaders))
+			row[0] = "张三"
+			row[1] = "2020级"
+			row[len(row)-1] = tc.value
+			reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+			if err != nil {
+				t.Fatalf("build xlsx: %v", err)
+			}
+			store := &fakeAlumniStore{}
+			result, err := NewAlumniService(store, nil, testDataDomainStore()).Import(
+				context.Background(),
+				common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+				nil,
+				reader,
+			)
+			if err != nil {
+				t.Fatalf("Import() error = %v", err)
+			}
+			if result.Success != 1 || len(store.batchProfiles) != 1 {
+				t.Fatalf("unexpected import result: %+v", result)
+			}
+			domain := store.batchProfiles[0].DataDomainID
+			if domain == nil || *domain != 2 {
+				t.Fatalf("data domain = %v, want 2", domain)
+			}
+		})
+	}
+}
+
+func TestImportInvalidDataDomainListsOptions(t *testing.T) {
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "张三"
+	row[1] = "2020级"
+	row[len(row)-1] = "unknown"
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	result, err := NewAlumniService(&fakeAlumniStore{}, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 0 || len(result.Errors) != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	message := result.Errors[0].Message
+	if !strings.Contains(message, "可选值") || !strings.Contains(message, "undergraduate（本科生）") || !strings.Contains(message, "mpa（MPA专业学位研究生）") {
+		t.Fatalf("expected actionable domain error, got %q", message)
+	}
+}
+
+func TestImportRequiresDomainColumnWithoutTargetDomain(t *testing.T) {
+	reader, err := buildXLSXReader(alumniColumnHeaders, [][]string{{"张三", "2020级"}})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	_, err = NewAlumniService(&fakeAlumniStore{}, nil).Import(
+		context.Background(),
+		common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+		nil,
+		reader,
+	)
+	if !errors.Is(err, common.ErrImportDomainRequired) {
+		t.Fatalf("Import() error = %v, want ErrImportDomainRequired", err)
+	}
+}
+
+func TestImportTemplateExplainsDomainsAndExampleIsImportable(t *testing.T) {
+	template, err := buildTemplateXLSX()
+	if err != nil {
+		t.Fatalf("build template: %v", err)
+	}
+	f, err := excelize.OpenReader(bytes.NewReader(template.Data))
+	if err != nil {
+		t.Fatalf("open template: %v", err)
+	}
+	defer f.Close()
+
+	rows, err := f.GetRows("Sheet1")
+	if err != nil {
+		t.Fatalf("read data sheet: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0]) != len(alumniImportColumnHeaders) {
+		t.Fatalf("unexpected template data sheet: %d rows", len(rows))
+	}
+	if rows[0][len(rows[0])-1] != "所属领域" {
+		t.Fatalf("expected 所属领域 header, got %q", rows[0][len(rows[0])-1])
+	}
+
+	notes, err := f.GetRows("填写说明")
+	if err != nil {
+		t.Fatalf("read note sheet: %v", err)
+	}
+	var noteText strings.Builder
+	for _, row := range notes {
+		noteText.WriteString(strings.Join(row, " "))
+		noteText.WriteString("\n")
+	}
+	for _, want := range []string{"undergraduate", "academic_graduate", "mpa", "MPA专业学位研究生", "示例校友", "2024级", "数字 ID"} {
+		if !strings.Contains(noteText.String(), want) {
+			t.Fatalf("template guide missing %q: %s", want, noteText.String())
+		}
+	}
+
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "示例校友"
+	row[1] = "2024级"
+	row[len(row)-1] = "mpa"
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build example xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	result, err := NewAlumniService(store, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("example row import failed: %v", err)
+	}
+	if result.Success != 1 {
+		t.Fatalf("example row should import successfully: %+v", result)
+	}
+}
+
+func TestImportTemplateBlankRowIsRejected(t *testing.T) {
+	template, err := buildTemplateXLSX()
+	if err != nil {
+		t.Fatalf("build template: %v", err)
+	}
+	_, err = NewAlumniService(&fakeAlumniStore{}, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+		nil,
+		bytes.NewReader(template.Data),
+	)
+	if !errors.Is(err, common.ErrImportNoDataRows) {
+		t.Fatalf("Import() error = %v, want ErrImportNoDataRows", err)
+	}
+}
+
+func TestSingleDomainAdminRejectsCrossDomainRows(t *testing.T) {
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "跨域校友"
+	row[1] = "2020级"
+	row[len(row)-1] = "mpa"
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	result, err := NewAlumniService(store, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 2, Role: common.RoleAdmin, DomainIDs: []uint64{1}},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 0 || len(result.Errors) != 1 {
+		t.Fatalf("cross-domain row should be rejected, got %+v", result)
+	}
+	if !strings.Contains(result.Errors[0].Message, "不一致") {
+		t.Fatalf("expected mismatch message, got %q", result.Errors[0].Message)
+	}
+	if len(store.batchProfiles) != 0 {
+		t.Fatalf("cross-domain row must not be created: %+v", store.batchProfiles)
+	}
+}
+
+func TestSingleDomainAdminCanImportMatchingDomainRows(t *testing.T) {
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "MPA校友"
+	row[1] = "2020级"
+	row[len(row)-1] = "mpa"
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	result, err := NewAlumniService(store, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 2, Role: common.RoleAdmin, DomainIDs: []uint64{2}},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 1 || len(store.batchProfiles) != 1 {
+		t.Fatalf("matching row should import, got %+v", result)
+	}
+	if domain := store.batchProfiles[0].DataDomainID; domain == nil || *domain != 2 {
+		t.Fatalf("data domain = %v, want 2", domain)
+	}
+}
+
+func TestImportRejectsDisabledDataDomain(t *testing.T) {
+	domains := &fakeImportDataDomainStore{domains: []*model.DataDomain{
+		{ID: 1, Code: common.DataDomainUndergraduate, Name: "本科生", Status: common.DataDomainStatusActive},
+		{ID: 3, Code: "legacy_program", Name: "历史项目", Status: common.DataDomainStatusDisabled},
+	}}
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "历史校友"
+	row[1] = "2010级"
+	row[len(row)-1] = "legacy_program"
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	result, err := NewAlumniService(&fakeAlumniStore{}, nil, domains).Import(
+		context.Background(),
+		common.AccessContext{UserID: 1, Role: common.RoleSuperAdmin},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 0 || len(result.Errors) != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if !strings.Contains(result.Errors[0].Message, "已停用") {
+		t.Fatalf("expected disabled domain message, got %q", result.Errors[0].Message)
+	}
+}
+
+func TestSingleDomainAdminAllowsBlankDomain(t *testing.T) {
+	row := make([]string, len(alumniImportColumnHeaders))
+	row[0] = "空白领域校友"
+	row[1] = "2020级"
+	row[len(row)-1] = ""
+	reader, err := buildXLSXReader(alumniImportColumnHeaders, [][]string{row})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	store := &fakeAlumniStore{}
+	result, err := NewAlumniService(store, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 2, Role: common.RoleAdmin, DomainIDs: []uint64{1}},
+		nil,
+		reader,
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if result.Success != 1 || len(store.batchProfiles) != 1 {
+		t.Fatalf("blank domain should use the only authorized domain, got %+v", result)
+	}
+	if domain := store.batchProfiles[0].DataDomainID; domain == nil || *domain != 1 {
+		t.Fatalf("data domain = %v, want 1", domain)
+	}
+}
+
+func TestSingleDomainAdminRejectsExplicitUnauthorizedDomain(t *testing.T) {
+	reader, err := buildXLSXReader(alumniColumnHeaders, [][]string{{"张三", "2020级"}})
+	if err != nil {
+		t.Fatalf("build xlsx: %v", err)
+	}
+	otherDomainID := uint64(2)
+	_, err = NewAlumniService(&fakeAlumniStore{}, nil, testDataDomainStore()).Import(
+		context.Background(),
+		common.AccessContext{UserID: 2, Role: common.RoleAdmin, DomainIDs: []uint64{1}},
+		&otherDomainID,
+		reader,
+	)
+	if !errors.Is(err, common.ErrPermissionDenied) {
+		t.Fatalf("Import() error = %v, want ErrPermissionDenied", err)
 	}
 }

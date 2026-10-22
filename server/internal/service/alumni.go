@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/cache"
@@ -43,7 +44,10 @@ var alumniColumnHeaders = []string{"姓名", "年级", "班级", "届数", "辅�
 // alumniImportColumnHeaders 在通用校友字段外增加所属领域，供多域管理员逐行指定目标领域。
 var alumniImportColumnHeaders = append(append([]string{}, alumniColumnHeaders...), "所属领域")
 
-func exportRow(item *model.AlumniProfile) []string {
+// alumniExportColumnHeaders 必须与 alumniImportColumnHeaders 保持一致，改动需同步，否则导出文件无法回灌。
+var alumniExportColumnHeaders = append([]string{}, alumniImportColumnHeaders...)
+
+func exportRow(item *model.AlumniProfile, dataDomainCode string) []string {
 	return []string{
 		sanitizeExportValue(item.Name),
 		sanitizeExportValue(item.Grade),
@@ -60,6 +64,7 @@ func exportRow(item *model.AlumniProfile) []string {
 		sanitizeExportValue(stringOrEmpty(item.Gender)),
 		sanitizeExportValue(stringOrEmpty(item.Mobile)),
 		sanitizeExportValue(stringOrEmpty(item.Email)),
+		sanitizeExportValue(dataDomainCode),
 	}
 }
 
@@ -570,7 +575,21 @@ type importAuditDetail struct {
 }
 
 func (s *AlumniService) buildAndAuditExport(ctx context.Context, operator common.AccessContext, query do.AlumniListQuery, items []*model.AlumniProfile, format string) (*ExportResult, error) {
-	result, err := s.buildExport(maskExportItems(items, operator), format)
+	domainCodes, err := s.dataDomainCodeMap(ctx)
+	if err != nil {
+		logger.Error("failed to load data domains for export", zap.Error(err))
+		return nil, err
+	}
+	missingCodeRows := 0
+	for _, item := range items {
+		if item != nil && domainCodes[item.DataDomainID] == "" {
+			missingCodeRows++
+		}
+	}
+	if missingCodeRows > 0 {
+		logger.Warn("export rows missing data domain code", zap.Int("rows", missingCodeRows))
+	}
+	result, err := s.buildExport(maskExportItems(items, operator), format, domainCodes)
 	if err != nil {
 		return nil, err
 	}
@@ -595,13 +614,31 @@ func (s *AlumniService) buildAndAuditExport(ctx context.Context, operator common
 	return result, nil
 }
 
-func (s *AlumniService) buildExport(items []*model.AlumniProfile, format string) (*ExportResult, error) {
+func (s *AlumniService) buildExport(items []*model.AlumniProfile, format string, domainCodes map[uint64]string) (*ExportResult, error) {
 	switch format {
 	case "csv":
-		return buildCSV(items)
+		return buildCSV(items, domainCodes)
 	default:
-		return buildXLSX(items)
+		return buildXLSX(items, domainCodes)
 	}
+}
+
+// dataDomainCodeMap 返回数据域 ID 到编码的映射；包含已停用数据域，保证历史档案也能导出编码。
+func (s *AlumniService) dataDomainCodeMap(ctx context.Context) (map[uint64]string, error) {
+	codes := make(map[uint64]string)
+	if s.dataDomains == nil {
+		return codes, nil
+	}
+	domains, err := s.dataDomains.ListDataDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, domain := range domains {
+		if domain != nil {
+			codes[domain.ID] = domain.Code
+		}
+	}
+	return codes, nil
 }
 
 // maskExportItems 为无敏感字段权限的导出请求清空受保护字段，且不修改缓存或仓储返回对象。
@@ -639,36 +676,47 @@ func buildTemplateXLSX() (*ExportResult, error) {
 	f := excelize.NewFile()
 	defer f.Close()
 
-	sw, err := f.NewStreamWriter("Sheet1")
-	if err != nil {
-		logger.Error("build template: create stream writer", zap.Error(err))
-		return nil, fmt.Errorf("create stream writer: %w", err)
-	}
-
-	// 写表头行
 	headerRow := make([]any, len(alumniImportColumnHeaders))
 	for i, h := range alumniImportColumnHeaders {
 		headerRow[i] = h
 	}
-	if err := sw.SetRow("A1", headerRow); err != nil {
+	if err := f.SetSheetRow("Sheet1", "A1", &headerRow); err != nil {
 		logger.Error("build template: write header", zap.Error(err))
 		return nil, fmt.Errorf("write header: %w", err)
 	}
 
-	// 写一条空行，提示用户按此结构填写
+	// 数据表只写表头 + 一条空白行；示例与填写规则放到「填写说明」，避免示例数据被误导入。
 	emptyRow := make([]any, len(alumniImportColumnHeaders))
 	for i := range emptyRow {
 		emptyRow[i] = ""
 	}
-	if err := sw.SetRow("A2", emptyRow); err != nil {
+	if err := f.SetSheetRow("Sheet1", "A2", &emptyRow); err != nil {
 		logger.Error("build template: write empty row", zap.Error(err))
 		return nil, fmt.Errorf("write empty row: %w", err)
 	}
 
-	if err := sw.Flush(); err != nil {
-		logger.Error("build template: flush stream writer", zap.Error(err))
-		return nil, fmt.Errorf("flush stream: %w", err)
+	const noteSheet = "填写说明"
+	if _, err := f.NewSheet(noteSheet); err != nil {
+		logger.Error("build template: create note sheet", zap.Error(err))
+		return nil, fmt.Errorf("create note sheet: %w", err)
 	}
+	notes := [][]any{
+		{"所属领域填写规则"},
+		{"编码", "显示名称"},
+		{"undergraduate", "本科生"},
+		{"academic_graduate", "学术学位研究生"},
+		{"mpa", "MPA专业学位研究生"},
+		{"可填写编码（推荐）、显示名称或数字 ID；单域管理员留空时按唯一培养类别处理，填写其他类别会逐行报错；显式选择导入目标培养类别时本列被忽略。"},
+		{"示例数据：姓名「示例校友」、年级「2024级」、所属领域「mpa」，按此格式从数据表第 2 行开始填写。"},
+	}
+	for i, row := range notes {
+		cell, _ := excelize.CoordinatesToCellName(1, i+1)
+		if err := f.SetSheetRow(noteSheet, cell, &row); err != nil {
+			logger.Error("build template: write note row", zap.Error(err))
+			return nil, fmt.Errorf("write note row: %w", err)
+		}
+	}
+	f.SetActiveSheet(0)
 
 	var buf bytes.Buffer
 	if err := f.Write(&buf); err != nil {
@@ -683,7 +731,7 @@ func buildTemplateXLSX() (*ExportResult, error) {
 	}, nil
 }
 
-func buildXLSX(items []*model.AlumniProfile) (*ExportResult, error) {
+func buildXLSX(items []*model.AlumniProfile, domainCodes map[uint64]string) (*ExportResult, error) {
 	f := excelize.NewFile()
 	defer f.Close()
 
@@ -692,8 +740,8 @@ func buildXLSX(items []*model.AlumniProfile) (*ExportResult, error) {
 		return nil, fmt.Errorf("create stream writer: %w", err)
 	}
 
-	headerRow := make([]any, len(alumniColumnHeaders))
-	for i, h := range alumniColumnHeaders {
+	headerRow := make([]any, len(alumniExportColumnHeaders))
+	for i, h := range alumniExportColumnHeaders {
 		headerRow[i] = h
 	}
 	if err := sw.SetRow("A1", headerRow); err != nil {
@@ -701,7 +749,7 @@ func buildXLSX(items []*model.AlumniProfile) (*ExportResult, error) {
 	}
 
 	for i, item := range items {
-		row := exportRow(item)
+		row := exportRow(item, domainCodes[item.DataDomainID])
 		vals := make([]any, len(row))
 		for j, v := range row {
 			vals[j] = v
@@ -728,18 +776,18 @@ func buildXLSX(items []*model.AlumniProfile) (*ExportResult, error) {
 	}, nil
 }
 
-func buildCSV(items []*model.AlumniProfile) (*ExportResult, error) {
+func buildCSV(items []*model.AlumniProfile, domainCodes map[uint64]string) (*ExportResult, error) {
 	var buf bytes.Buffer
 
 	// UTF-8 BOM
 	buf.Write([]byte{0xEF, 0xBB, 0xBF})
 
 	w := csv.NewWriter(&buf)
-	if err := w.Write(alumniColumnHeaders); err != nil {
+	if err := w.Write(alumniExportColumnHeaders); err != nil {
 		return nil, fmt.Errorf("write csv header: %w", err)
 	}
 	for _, item := range items {
-		if err := w.Write(exportRow(item)); err != nil {
+		if err := w.Write(exportRow(item, domainCodes[item.DataDomainID])); err != nil {
 			return nil, fmt.Errorf("write csv row: %w", err)
 		}
 	}
@@ -765,12 +813,23 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 		return nil, common.ErrPermissionDenied
 	}
 	targetProfile := do.AlumniCreateProfile{DataDomainID: dataDomainID}
+	// autoTargetDomain 表示目标域由「唯一授权域」自动推断而来，而非用户显式选择。
+	// 自动推断时需要校验文件里的所属领域，避免跨域档案被静默改写到本域。
+	autoTargetDomain := false
 	if operator.Role == common.RoleAdmin {
 		if len(operator.DomainIDs) == 0 {
 			return nil, common.ErrPermissionDenied
 		}
 		if len(operator.DomainIDs) == 1 {
-			targetProfile.DataDomainID = &operator.DomainIDs[0]
+			if dataDomainID != nil {
+				if !operator.CanAccessDomain(*dataDomainID) {
+					return nil, common.ErrPermissionDenied
+				}
+				targetProfile.DataDomainID = dataDomainID
+			} else {
+				autoTargetDomain = true
+				targetProfile.DataDomainID = &operator.DomainIDs[0]
+			}
 		} else if dataDomainID != nil && !operator.CanAccessDomain(*dataDomainID) {
 			return nil, common.ErrPermissionDenied
 		}
@@ -801,22 +860,48 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 	}
 
 	domainByCode := map[string]*model.DataDomain{}
-	if targetProfile.DataDomainID == nil && hasDomainColumn {
+	domainByName := map[string]*model.DataDomain{}
+	domainByID := map[uint64]*model.DataDomain{}
+	domainOptions := ""
+	// 依次按编码、显示名称、数字 ID 查找，避免三类键写进同一个 map 时互相覆盖。
+	var domainLookup func(raw string) *model.DataDomain
+	if hasDomainColumn && (targetProfile.DataDomainID == nil || autoTargetDomain) {
 		if s.dataDomains == nil {
 			return nil, common.ErrDatabaseUnavailable
 		}
-		activeDomains, err := s.dataDomains.ListActiveDataDomains(ctx)
+		domains, err := s.dataDomains.ListDataDomains(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, domain := range activeDomains {
-			if domain != nil {
-				domainByCode[domain.Code] = domain
+		activeDomains := make([]*model.DataDomain, 0, len(domains))
+		for _, domain := range domains {
+			if domain == nil {
+				continue
 			}
+			domainByCode[strings.ToLower(domain.Code)] = domain
+			domainByName[strings.ToLower(domain.Name)] = domain
+			domainByID[domain.ID] = domain
+			if domain.Status == common.DataDomainStatusActive {
+				activeDomains = append(activeDomains, domain)
+			}
+		}
+		domainOptions = importDomainOptions(activeDomains)
+		domainLookup = func(raw string) *model.DataDomain {
+			key := strings.ToLower(raw)
+			if domain := domainByCode[key]; domain != nil {
+				return domain
+			}
+			if domain := domainByName[key]; domain != nil {
+				return domain
+			}
+			if id, err := strconv.ParseUint(raw, 10, 64); err == nil {
+				return domainByID[id]
+			}
+			return nil
 		}
 	}
 	if targetProfile.DataDomainID == nil && !hasDomainColumn {
-		return nil, common.ErrInvalidRequest
+		return nil, common.ErrImportDomainRequired
 	}
 
 	type rowProfile struct {
@@ -825,24 +910,56 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 	}
 	var validRows []rowProfile
 	rowErrors := make([]dto.AlumniRowError, 0)
+	dataRowCount := 0
 
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]
 		rowNum := i + 1
+		if isBlankImportRow(row) {
+			continue
+		}
+		dataRowCount++
 
 		profile := parseRowToProfile(row)
 		profile = profile.Normalize()
 		if targetProfile.DataDomainID != nil {
+			if autoTargetDomain && hasDomainColumn {
+				// 单域管理员留空时直接使用唯一授权域；只有显式填写其他域才逐行报错。
+				rawDomain := strings.TrimSpace(cellValue(row, len(alumniImportColumnHeaders)-1))
+				if rawDomain != "" {
+					domain := domainLookup(rawDomain)
+					if domain == nil {
+						rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域无效，可选值：" + domainOptions})
+						continue
+					}
+					if domain.Status != common.DataDomainStatusActive {
+						rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域已停用，不能导入"})
+						continue
+					}
+					if domain.ID != *targetProfile.DataDomainID {
+						rowErrors = append(rowErrors, dto.AlumniRowError{
+							Row:     rowNum,
+							Name:    profile.Name,
+							Message: fmt.Sprintf("该行所属领域为 %s，与本次导入目标培养类别不一致：请改用多域账号导入，或选择正确的导入目标培养类别", domain.Code),
+						})
+						continue
+					}
+				}
+			}
 			profile.DataDomainID = targetProfile.DataDomainID
 		} else {
-			code := strings.TrimSpace(cellValue(row, len(alumniImportColumnHeaders)-1))
-			domain, exists := domainByCode[code]
-			if code == "" {
+			rawDomain := strings.TrimSpace(cellValue(row, len(alumniImportColumnHeaders)-1))
+			if rawDomain == "" {
 				rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域为空"})
 				continue
 			}
-			if !exists {
-				rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域无效"})
+			domain := domainLookup(rawDomain)
+			if domain == nil {
+				rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域无效，可选值：" + domainOptions})
+				continue
+			}
+			if domain.Status != common.DataDomainStatusActive {
+				rowErrors = append(rowErrors, dto.AlumniRowError{Row: rowNum, Name: profile.Name, Message: "所属领域已停用，不能导入"})
 				continue
 			}
 			if !operator.IsSuperAdmin() && !operator.CanAccessDomain(domain.ID) {
@@ -866,6 +983,10 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 		}
 
 		validRows = append(validRows, rowProfile{rowNum: rowNum, profile: profile})
+	}
+
+	if dataRowCount == 0 {
+		return nil, common.ErrImportNoDataRows
 	}
 
 	if len(validRows) > 0 {
@@ -893,7 +1014,7 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 		validProfiles := dedupedProfiles
 
 		result := &dto.AlumniImportResult{
-			Total:  len(rows) - 1,
+			Total:  dataRowCount,
 			Errors: rowErrors,
 		}
 
@@ -925,7 +1046,7 @@ func (s *AlumniService) Import(ctx context.Context, operator common.AccessContex
 	}
 
 	result := &dto.AlumniImportResult{
-		Total:  len(rows) - 1,
+		Total:  dataRowCount,
 		Errors: rowErrors,
 	}
 	s.writeImportAudit(ctx, operator, nil, nil, result)
@@ -1107,6 +1228,27 @@ func (s *AlumniService) importManagementScope(ctx context.Context, domainIDs []u
 		return defaultAuditScope
 	}
 	return strings.Join(names, "、")
+}
+
+// isBlankImportRow 判断整行是否为空，用于跳过模板空行与用户文件末尾的空白行。
+func isBlankImportRow(row []string) bool {
+	for _, cell := range row {
+		if strings.TrimSpace(cell) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func importDomainOptions(domains []*model.DataDomain) string {
+	parts := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		if domain == nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s（%s）", domain.Code, domain.Name))
+	}
+	return strings.Join(parts, "、")
 }
 
 func matchesImportHeaders(actual, expected []string) bool {
