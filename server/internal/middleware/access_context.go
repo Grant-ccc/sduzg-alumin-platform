@@ -7,9 +7,11 @@ import (
 	"sync"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
+	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/logger"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/response"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 const AccessContextKey = "access_context"
@@ -55,9 +57,8 @@ func (l *AccessContextLoader) Load(ctx context.Context, userID uint64) (*common.
 	if user.Status != common.UserStatusActive {
 		return nil, common.ErrAccountDisabled
 	}
-	switch user.Role {
-	case common.RoleAlumni, common.RoleAdmin, common.RoleSuperAdmin:
-	default:
+	if !common.IsKnownUserRole(user.Role) {
+		logger.Warn("unknown database role", zap.Uint64("user_id", user.ID), zap.String("role", user.Role))
 		return nil, common.ErrPermissionDenied
 	}
 

@@ -9,8 +9,11 @@ import (
 	"time"
 
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
+	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/logger"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/gorm"
 )
 
@@ -278,6 +281,28 @@ func TestLoadAccessContextFailsClosedAndLoadsOncePerRequest(t *testing.T) {
 	failing.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/alumni", nil))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected failure to be denied with status %d, got %d", http.StatusInternalServerError, rec.Code)
+	}
+}
+
+func TestAccessContextLoaderLogsUnknownDatabaseRole(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	previous := logger.L()
+	logger.SetLogger(zap.New(core))
+	t.Cleanup(func() { logger.SetLogger(previous) })
+	users := &fakeAccessContextUserStore{user: &model.User{
+		ID: 7, Role: "Admin", Status: common.UserStatusActive, Account: "private-account", PasswordHash: "must-not-be-logged",
+	}}
+	_, err := NewAccessContextLoader(users, nil).Load(context.Background(), 7)
+	if !errors.Is(err, common.ErrPermissionDenied) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	entries := logs.FilterMessage("unknown database role").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one structured warning, got %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if len(fields) != 2 || fields["user_id"] != uint64(7) || fields["role"] != "Admin" {
+		t.Fatalf("warning must contain only user_id and the persisted role: %+v", fields)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -226,6 +227,12 @@ func TestAlumniQueryAccessIntegration(t *testing.T) {
 
 	t.Run("database role changes affect the same token immediately", func(t *testing.T) {
 		user := users["super-admin"]
+		originalRole := user.Role
+		t.Cleanup(func() {
+			if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", originalRole).Error; err != nil {
+				t.Errorf("restore original database role: %v", err)
+			}
+		})
 		for _, role := range []string{common.RoleAlumni, "owner", common.RoleSuperAdmin} {
 			if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", role).Error; err != nil {
 				t.Fatal(err)
@@ -237,6 +244,43 @@ func TestAlumniQueryAccessIntegration(t *testing.T) {
 			assertAPIStatus(t, engine, http.MethodGet, "/api/v1/super-admin/admins", "", tokens["super-admin"], want)
 			if role == "owner" {
 				assertAPIStatus(t, engine, http.MethodGet, "/api/v1/history/entries", "", tokens["super-admin"], http.StatusForbidden)
+			}
+		}
+	})
+
+	t.Run("invalid role login returns readable denial without token", func(t *testing.T) {
+		user := users["super-admin"]
+		originalRole, originalHash := user.Role, user.PasswordHash
+		t.Cleanup(func() {
+			if err := db.Model(&model.User{}).Where("id = ?", user.ID).
+				Updates(map[string]any{"role": originalRole, "password_hash": originalHash}).Error; err != nil {
+				t.Errorf("restore login fixture: %v", err)
+			}
+		})
+		hash, err := bcrypt.GenerateFromPassword([]byte("RoleCheck123"), bcrypt.MinCost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("password_hash", string(hash)).Error; err != nil {
+			t.Fatal(err)
+		}
+		for _, role := range []string{"owner", "Admin", ""} {
+			if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", role).Error; err != nil {
+				t.Fatal(err)
+			}
+			request, err := json.Marshal(map[string]string{"account": user.Account, "password": "RoleCheck123"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := performAPIRequest(t, engine, http.MethodPost, "/api/v1/auth/login", string(request), "")
+			var body struct {
+				Code    int             `json:"code"`
+				Message string          `json:"message"`
+				Data    json.RawMessage `json:"data"`
+			}
+			decodeAPIResponse(t, rec, &body)
+			if rec.Code != http.StatusForbidden || body.Code != response.CodeForbidden || body.Message != "账号角色无效，请联系管理员" || len(body.Data) != 0 {
+				t.Fatalf("invalid role must not receive a login token: %d %s", rec.Code, rec.Body.String())
 			}
 		}
 	})
