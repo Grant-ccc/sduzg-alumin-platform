@@ -11,6 +11,7 @@ import (
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/common"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type fakeAccessContextUserStore struct {
@@ -177,6 +178,30 @@ func TestAccessContextLoaderRejectsInactiveOrMissingUser(t *testing.T) {
 		want error
 	}{
 		{
+			name: "nil user",
+			want: common.ErrUserNotFound,
+		},
+		{
+			name: "wrong identity",
+			user: &model.User{ID: 8, Role: common.RoleSuperAdmin, Status: common.UserStatusActive},
+			want: common.ErrUserNotFound,
+		},
+		{
+			name: "soft deleted",
+			user: &model.User{ID: 7, Role: common.RoleSuperAdmin, Status: common.UserStatusActive, DeletedAt: gorm.DeletedAt{Valid: true}},
+			want: common.ErrUserNotFound,
+		},
+		{
+			name: "unknown role",
+			user: &model.User{ID: 7, Role: "owner", Status: common.UserStatusActive},
+			want: common.ErrPermissionDenied,
+		},
+		{
+			name: "empty role",
+			user: &model.User{ID: 7, Status: common.UserStatusActive},
+			want: common.ErrPermissionDenied,
+		},
+		{
 			name: "disabled",
 			user: &model.User{ID: 7, Role: common.RoleAdmin, Status: common.UserStatusDisabled},
 			want: common.ErrAccountDisabled,
@@ -253,6 +278,29 @@ func TestLoadAccessContextFailsClosedAndLoadsOncePerRequest(t *testing.T) {
 	failing.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/alumni", nil))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected failure to be denied with status %d, got %d", http.StatusInternalServerError, rec.Code)
+	}
+}
+
+func TestAccessContextLoaderRejectsZeroIdentityWithoutQuery(t *testing.T) {
+	users := &fakeAccessContextUserStore{}
+	_, err := NewAccessContextLoader(users, nil).Load(context.Background(), 0)
+	if !errors.Is(err, common.ErrUserNotFound) || users.calls != 0 {
+		t.Fatalf("zero identity must fail before query: err=%v calls=%d", err, users.calls)
+	}
+}
+
+func TestUnknownDatabaseRoleCannotReachAuthenticatedHandlers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set(CurrentUserIDKey, uint64(7)) })
+	engine.Use(LoadAccessContext(NewAccessContextLoader(
+		&fakeAccessContextUserStore{user: &model.User{ID: 7, Role: "owner", Status: common.UserStatusActive}}, nil,
+	)))
+	engine.GET("/history", func(c *gin.Context) { t.Error("unknown role reached protected handler") })
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/history?role=super_admin", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unknown role status=%d, want 403: %s", rec.Code, rec.Body.String())
 	}
 }
 

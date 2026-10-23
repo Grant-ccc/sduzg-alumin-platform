@@ -14,6 +14,7 @@ import (
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/model"
 	"github.com/JunLang-7/sduzg-alumin-platform/server/internal/response"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -207,5 +208,36 @@ func TestAlumniQueryAccessIntegration(t *testing.T) {
 		assertAPIStatus(t, engine, http.MethodGet, "/api/v1/history/contributions/me", "", tokens["alumni"], http.StatusOK)
 		assertAPIStatus(t, engine, http.MethodPost, "/api/v1/history/contributions", `{"title":"权限测试投稿","content":"本人仍可投稿","source_note":"测试来源"}`, tokens["alumni"], http.StatusCreated)
 		assertAPIStatus(t, engine, http.MethodGet, "/api/v1/alumni/me", "", tokens["admin"], http.StatusForbidden)
+	})
+
+	t.Run("legacy token role cannot override database role", func(t *testing.T) {
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"uid":  users["alumni"].ID,
+			"role": common.RoleSuperAdmin,
+			"exp":  time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte(secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertAPIStatus(t, engine, http.MethodGet, "/api/v1/admin/dashboard/overview?role=super_admin", "", token, http.StatusForbidden)
+		assertAPIStatus(t, engine, http.MethodGet, "/api/v1/super-admin/admins", "", token, http.StatusForbidden)
+		assertAPIStatus(t, engine, http.MethodPost, "/api/v1/admin/alumni", `{"role":"super_admin"}`, token, http.StatusForbidden)
+	})
+
+	t.Run("database role changes affect the same token immediately", func(t *testing.T) {
+		user := users["super-admin"]
+		for _, role := range []string{common.RoleAlumni, "owner", common.RoleSuperAdmin} {
+			if err := db.Model(&model.User{}).Where("id = ?", user.ID).Update("role", role).Error; err != nil {
+				t.Fatal(err)
+			}
+			want := http.StatusForbidden
+			if role == common.RoleSuperAdmin {
+				want = http.StatusOK
+			}
+			assertAPIStatus(t, engine, http.MethodGet, "/api/v1/super-admin/admins", "", tokens["super-admin"], want)
+			if role == "owner" {
+				assertAPIStatus(t, engine, http.MethodGet, "/api/v1/history/entries", "", tokens["super-admin"], http.StatusForbidden)
+			}
+		}
 	})
 }
